@@ -20,6 +20,7 @@ import (
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/registry"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/scaleascii"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/sqlitestore"
+	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/w100"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/centralsync"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/cycle"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/domain"
@@ -53,10 +54,16 @@ type config struct {
 	centralTicketURL, centralHeartbeatURL, centralToken string
 	centralSyncInterval, centralHeartbeatInterval, centralTimeout time.Duration
 	simulation bool
+	scaleDriver, scalePort, scaleParity string
+	scaleBaud, scaleStopBits int
+	scaleUnit uint
+	scalePoll, scaleRepeat time.Duration
+	probe bool
 }
 
 func main() {
 	cfg, serviceAction := parseFlags()
+	if cfg.probe { if err := probe(cfg); err != nil { log.Fatal(err) }; return }
 	if serviceAction != "" { if err := manageService(serviceAction); err != nil { log.Fatal(err) }; return }
 	runner := func(ctx context.Context) error { return run(ctx, cfg) }
 	isService, err := winservice.IsService(); if err != nil { log.Fatalf("detect Windows Service context: %v", err) }
@@ -102,9 +109,20 @@ func parseFlags() (config, string) {
 	flag.DurationVar(&c.centralHeartbeatInterval,"central-heartbeat-interval",30*time.Second,"Central heartbeat interval")
 	flag.DurationVar(&c.centralTimeout,"central-timeout",5*time.Second,"Central HTTP timeout")
 	flag.BoolVar(&c.simulation,"simulation",false,"enable explicit /sim/* test ingress endpoints")
+	flag.StringVar(&c.scaleDriver,"scale-driver","ascii","scale input: ascii (TCP text stream, -scale-addr) or w100 (LAUMAS W100 Modbus RTU, -scale-port)")
+	flag.StringVar(&c.scalePort,"scale-port","","W100 line: COM5, /dev/ttyUSB0, or tcp:host:port for an RS485-Ethernet gateway")
+	flag.IntVar(&c.scaleBaud,"scale-baud",9600,"W100 baud rate, as set in the instrument's serial menu")
+	flag.StringVar(&c.scaleParity,"scale-parity","N","W100 parity: N, E or O")
+	flag.IntVar(&c.scaleStopBits,"scale-stop-bits",1,"W100 stop bits: 1 or 2")
+	flag.UintVar(&c.scaleUnit,"scale-unit-id",1,"W100 Modbus address 1..99")
+	flag.DurationVar(&c.scalePoll,"scale-poll",200*time.Millisecond,"W100 poll interval")
+	flag.DurationVar(&c.scaleRepeat,"scale-repeat-every",time.Second,"W100: an unchanged answer is journaled and delivered at most this often; 0 = every poll")
+	flag.BoolVar(&c.probe,"probe",false,"read the scale for 10 s, print each reading, and exit (bench wiring check)")
 	flag.StringVar(&serviceAction,"service","","Windows Service action: install|start|stop|status|uninstall")
 	flag.Parse()
 	if c.ioUnitID > 255 { log.Fatal("io-unit-id must be 0..255") }
+	if c.scaleDriver != "ascii" && c.scaleDriver != "w100" { log.Fatal("scale-driver must be ascii or w100") }
+	if c.scaleDriver == "w100" && (c.scaleUnit < 1 || c.scaleUnit > 99) { log.Fatal("scale-unit-id must be 1..99") }
 	if c.pairMinElapsed < 0 || c.pairMaxElapsed < 0 { log.Fatal("pair elapsed limits cannot be negative") }
 	if c.pairMaxElapsed > 0 && c.pairMinElapsed > c.pairMaxElapsed { log.Fatal("pair-min-elapsed cannot exceed pair-max-elapsed") }
 	return c, serviceAction
@@ -140,8 +158,18 @@ func run(ctx context.Context, c config) error {
 	rfid.OnObservation=func(o domain.RFIDObservation){if err:=workflow.ObserveRFID(context.Background(),o);err!=nil{log.Printf("workflow RFID observation: %v",err)}}
 	lpr.OnObservation=func(o domain.LPRObservation){if err:=workflow.ObserveLPR(context.Background(),o);err!=nil{log.Printf("workflow LPR observation: %v",err)}}
 
-	scaleMonitor:=scaleascii.NewMonitor(c.scaleAddr!="",c.scaleAddr)
-	if c.scaleAddr!=""{collector:=&scaleascii.StreamCollector{Addr:c.scaleAddr,StationID:c.stationID,TransactionID:workflow.ActiveTransactionID,Journal:weightAudit,ReconnectDelay:c.reconnectDelay,OnReading:func(a domain.AuditedScaleReading){scaleMonitor.Reading(a.Reading);_ = workflow.ClearFault(context.Background(),domain.DeviceScale);if err:=workflow.ObserveScale(context.Background(),a);err!=nil{log.Printf("workflow audited scale observation: %v",err)}},OnFault:func(err error){scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:err.Error(),Overridable:false,Critical:true})}};go func(){if err:=collector.Run(ctx);err!=nil&&ctx.Err()==nil{scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:"raw weight collector stopped: "+err.Error(),Overridable:false,Critical:true});log.Printf("CRITICAL raw weight collector stopped: %v",err)}}()}
+	onScaleReading:=func(m *scaleascii.Monitor)func(domain.AuditedScaleReading){return func(a domain.AuditedScaleReading){m.Reading(a.Reading);_ = workflow.ClearFault(context.Background(),domain.DeviceScale);if err:=workflow.ObserveScale(context.Background(),a);err!=nil{log.Printf("workflow audited scale observation: %v",err)}}}
+	onScaleFault:=func(m *scaleascii.Monitor)func(error){return func(err error){m.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:err.Error(),Overridable:false,Critical:true})}}
+	onCollectorStopped:=func(m *scaleascii.Monitor,err error){if err!=nil&&ctx.Err()==nil{m.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:"raw weight collector stopped: "+err.Error(),Overridable:false,Critical:true});log.Printf("CRITICAL raw weight collector stopped: %v",err)}}
+	var scaleMonitor *scaleascii.Monitor
+	switch c.scaleDriver {
+	case "w100":
+		wc:=w100Collector(c);scaleMonitor=scaleascii.NewMonitor(c.scalePort!="",wc.Source())
+		if c.scalePort!=""{wc.TransactionID=workflow.ActiveTransactionID;wc.Journal=weightAudit;wc.OnReading=onScaleReading(scaleMonitor);wc.OnFault=onScaleFault(scaleMonitor);go func(){onCollectorStopped(scaleMonitor,wc.Run(ctx))}()}
+	default:
+		scaleMonitor=scaleascii.NewMonitor(c.scaleAddr!="",c.scaleAddr)
+		if c.scaleAddr!=""{collector:=&scaleascii.StreamCollector{Addr:c.scaleAddr,StationID:c.stationID,TransactionID:workflow.ActiveTransactionID,Journal:weightAudit,ReconnectDelay:c.reconnectDelay,OnReading:onScaleReading(scaleMonitor),OnFault:onScaleFault(scaleMonitor)};go func(){onCollectorStopped(scaleMonitor,collector.Run(ctx))}()}
+	}
 
 	ioMonitor:=runtimeio.NewMonitor(false);var safeOutputs runtimeio.Outputs
 	if c.ioAddr!=""{mapping,err:=modbustcp.ParseMapping(c.ioMapSpec);if err!=nil{return fmt.Errorf("io-map: %w",err)};if mapping.SafetyClear==nil{log.Printf("WARNING remote I/O enabled without safety_clear mapping; fail-safe SafetyClear=false will block automatic entry")};client:=&modbustcp.Client{Addr:c.ioAddr,UnitID:byte(c.ioUnitID),Timeout:c.ioTimeout};hardwareIO:=&modbustcp.IO{Client:client,Mapping:mapping};auditedOutputs:=&runtimeio.AuditedOutputs{Inner:hardwareIO,Audit:eventAudit,StationID:c.stationID,RuntimeGitSHA:gitSHA,TransactionID:workflow.ActiveTransactionID,OnAuditFailure:func(err error){_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceAuditStore,Health:domain.HealthFault,Reason:"operational audit output gate failed: "+err.Error(),Overridable:false,Critical:true})}};safeOutputs=auditedOutputs;ioMonitor=runtimeio.NewMonitor(true);controller:=&runtimeio.Controller{Workflow:workflow,Inputs:hardwareIO,Outputs:auditedOutputs,Monitor:ioMonitor,PollInterval:c.ioPoll,BuzzerPulse:c.buzzerPulse,BarrierFeedbackTimeout:c.barrierFeedbackTimeout};go func(){if err:=controller.Run(ctx);err!=nil&&ctx.Err()==nil{log.Printf("CRITICAL runtime I/O controller stopped: %v",err)}}()}
@@ -162,3 +190,35 @@ func run(ctx context.Context, c config) error {
 
 func parseIDs(spec string)map[string]bool{out:=map[string]bool{};for _,raw:=range strings.Split(spec,","){id:=strings.ToUpper(strings.TrimSpace(raw));if id!=""{out[id]=true}};return out}
 func keys(m map[string]bool)[]string{out:=make([]string,0,len(m));for k:=range m{out=append(out,k)};return out}
+
+func w100Collector(c config) *w100.Collector {
+	parity := byte('N')
+	if c.scaleParity != "" { parity = strings.ToUpper(c.scaleParity)[0] }
+	return &w100.Collector{Port: c.scalePort, Line: w100.LineSettings{Baud: c.scaleBaud, Parity: parity, StopBits: c.scaleStopBits},
+		Unit: byte(c.scaleUnit), Poll: c.scalePoll, RepeatEvery: c.scaleRepeat, ReconnectDelay: c.reconnectDelay, StationID: c.stationID}
+}
+
+// probe prints what the W100 says for 10 s, journaling nothing. Bench check only:
+// it never feeds the workflow.
+func probe(c config) error {
+	if c.scaleDriver != "w100" || c.scalePort == "" { return errors.New("-probe needs -scale-driver w100 -scale-port COMx") }
+	wc := w100Collector(c)
+	p, err := w100.Open(c.scalePort, wc.Line)
+	if err != nil { return err }
+	defer p.Close()
+	fmt.Printf("probing %s\n", wc.Source())
+	req := w100.ReadRequest(byte(c.scaleUnit), w100.RegStatus, w100.StatusBlockLen)
+	ok := 0
+	for end := time.Now().Add(10 * time.Second); time.Now().Before(end); time.Sleep(500 * time.Millisecond) {
+		raw, err := w100.Transact(p, req, 300*time.Millisecond)
+		if err != nil { fmt.Printf("%s  %v  % X\n", time.Now().Format("15:04:05.0"), err, raw); continue }
+		regs, err := w100.ParseReadResponse(byte(c.scaleUnit), w100.StatusBlockLen, raw)
+		if err != nil { fmt.Printf("%s  %v  % X\n", time.Now().Format("15:04:05.0"), err, raw); continue }
+		b, err := w100.Decode(regs)
+		if err != nil { fmt.Printf("%s  %v\n", time.Now().Format("15:04:05.0"), err); continue }
+		ok++
+		fmt.Printf("%s  %s\n", time.Now().Format("15:04:05.0"), b.Text())
+	}
+	if ok == 0 { return errors.New("no valid answer: check COM port, A/B wires, baud/parity and the W100 Modbus address") }
+	return nil
+}
