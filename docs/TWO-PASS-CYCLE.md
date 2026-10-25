@@ -146,15 +146,26 @@ both accepted weights come from authoritative audited stable frames
 weight relationship valid for the configured operation
 ```
 
-For the current inbound/unload cycle the semantic weights are:
+### Gross and tare follow the weights, not the pass order
+
+The physical directions never change: pass 1 is always `A_TO_B` and pass 2 is always `B_TO_A`. What the two weights *mean* depends on the goods:
 
 ```text
-W1 = GROSS (A -> B, before unloading)
-W2 = TARE  (B -> A, after unloading)
-NET = W1 - W2
+MATERIAL_IN   W1 > W2   loaded on A -> B, emptied at the store, empty on B -> A
+                        GROSS = W1, TARE = W2
+MATERIAL_OUT  W1 < W2   empty on A -> B, loaded at the store, loaded on B -> A
+                        GROSS = W2, TARE = W1
+
+NET = GROSS - TARE = |W1 - W2|
 ```
 
-A valid completion therefore requires `W1 > W2` and a positive valid net quantity. Minimum/maximum elapsed time and weight/net limits are configuration/business-master data; they must not be hidden constants in the state machine.
+A valid completion requires a positive net (`W1 != W2`). The result is recorded as `flow` on the cycle and on the final ticket (`MATERIAL_IN` / `MATERIAL_OUT`). Direction is never inferred from weight and the flow is never inferred from direction.
+
+`gross` / `tare` limits in the pair policy apply to the heavier / lighter weight respectively, whichever pass produced it. A small remainder of goods left on a truck at its "empty" weighing is simply part of that weight; the net is the difference actually weighed.
+
+The legacy inbound-only rule (the second pass must be lighter) is available as `-pair-require-gross-first`.
+
+Minimum/maximum elapsed time and weight/net limits are configuration/business-master data; they must not be hidden constants in the state machine.
 
 ## Orphan rule
 
@@ -167,7 +178,7 @@ first pass exists but no valid second pass before pair window expires
 B -> A vehicle arrives without a matching CALLED open cycle
 identity mismatch between passes
 invalid pair elapsed time
-W2 >= W1 for the current inbound/unload operation
+W1 == W2 (no net), or W2 > W1 when -pair-require-gross-first is set
 weight outside configured validity limits
 raw audit reference missing/invalid
 ```
@@ -223,19 +234,21 @@ Ticket
   vehicle identity
   first_pass
     direction = A_TO_B
-    gross_kg
+    weight_kg           (gross for MATERIAL_IN, tare for MATERIAL_OUT)
     observed_at
     raw_seq
     raw_hash
     camera evidence
   second_pass
     direction = B_TO_A
-    tare_kg
+    weight_kg           (tare for MATERIAL_IN, gross for MATERIAL_OUT)
     observed_at
     raw_seq
     raw_hash
     camera evidence
   pair_elapsed
+  gross_kg, tare_kg   (by role)
+  flow = MATERIAL_IN | MATERIAL_OUT
   net_kg = gross_kg - tare_kg
   pair validation result
   overrides
