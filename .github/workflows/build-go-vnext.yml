@@ -39,6 +39,7 @@ jobs:
         run: |
           go build -trimpath -o out/scale-sim.exe ./.github/testdata/scale-sim.go
           go build -trimpath -o out/modbus-io-sim.exe ./.github/testdata/modbus-io-sim.go
+          go build -trimpath -o out/w100-sim.exe ./.github/testdata/w100-sim.go
 
       - name: Runtime two-pass + SQLite + audit acceptance
         shell: pwsh
@@ -180,6 +181,81 @@ jobs:
             if(-not $ready){throw 'two-pass restart recovery failed'}
             Write-Host 'RESTART PASS: completed pair durable; physical workflow IDLE; no active queue replay'
           }finally{if($p2 -and -not $p2.HasExited){Stop-Process -Id $p2.Id -Force}}
+
+      - name: W100 Modbus RTU two-pass acceptance
+        shell: pwsh
+        run: |
+          $weightPath=Join-Path $PWD 'out/raw-weight-w100-ci.jsonl'
+          $eventPath=Join-Path $PWD 'out/events-w100-ci.jsonl'
+          $dbPath=Join-Path $PWD 'out/edge-w100-ci.db'
+          Remove-Item $weightPath,$eventPath,$dbPath,"$dbPath-wal","$dbPath-shm" -ErrorAction SilentlyContinue
+          $sim=Start-Process .\out\w100-sim.exe -PassThru
+          Start-Sleep -Milliseconds 600
+          $p=Start-Process .\out\plantops-edge-scale.exe -ArgumentList @(
+            '-scale-driver','w100','-scale-port','tcp:127.0.0.1:19003','-scale-unit-id','1','-scale-poll','100ms','-scale-repeat-every','1s',
+            '-listen','127.0.0.1:8082','-station-id','CI-W100-01','-raw-weight-journal',$weightPath,'-event-journal',$eventPath,'-db',$dbPath,
+            '-vehicle-map','RFID-DEMO-001=15C-123.45','-empty-scale-max-kg','200','-min-stable-weight-kg','1000','-stable-confirmations','2','-stable-tolerance-kg','20',
+            '-pair-max-elapsed','2h','-pair-min-net-kg','1000','-simulation'
+          ) -PassThru
+          $b='http://127.0.0.1:8082'
+          $post={param($u,$j) Invoke-RestMethod "$b$u" -Method Post -ContentType 'application/json' -Body $j}
+          try{
+            $ready=$false
+            for($i=0;$i -lt 40;$i++){
+              try{$scale=Invoke-RestMethod "$b/api/scale/status" -TimeoutSec 1; if($scale.connected -and $scale.last_reading.stable -and [int64]$scale.last_reading.weight_kg -eq 0){$ready=$true;break}}catch{}
+              Start-Sleep -Milliseconds 150
+            }
+            if(-not $ready){throw "W100 stable-zero proof failed: $($scale|ConvertTo-Json -Compress)"}
+
+            & $post '/sim/position' '{"entry_present":true,"safety_clear":true}' | Out-Null
+            & $post '/io/rfid' '{"tag":"RFID-DEMO-001","quality":99}' | Out-Null
+            & $post '/io/lpr' '{"plate":"15C-123.45","confidence":98}' | Out-Null
+            & $post '/sim/position' '{"front_present":true,"rear_present":true,"safety_clear":true}' | Out-Null
+            $queued=$false
+            for($i=0;$i -lt 80;$i++){
+              $wf=Invoke-RestMethod "$b/api/workflow"
+              if($wf.state -eq 'EXIT_AUTHORIZED' -and $wf.transaction.cycle_status -eq 'QUEUED'){$queued=$true;break}
+              if($wf.state -eq 'FAULT_LOCKOUT'){throw "pass1 lockout: $($wf.transaction.last_block_reason)"}
+              Start-Sleep -Milliseconds 150
+            }
+            if(-not $queued){throw "W100 pass1 not QUEUED: $($wf.state) $($wf.transaction.last_block_reason)"}
+            if([int64]$wf.transaction.accepted_weight.weight_kg -ne 28460){throw 'W100 pass1 gross mismatch'}
+
+            & $post '/sim/position' '{"exit_present":true,"safety_clear":true}' | Out-Null
+            & $post '/sim/position' '{"safety_clear":true}' | Out-Null
+            & $post '/sim/position' '{"safety_clear":true}' | Out-Null
+            $queue=Invoke-RestMethod "$b/api/queue"
+            $cycleId=[string]$queue.items[0].id
+            Invoke-RestMethod "$b/api/queue/$cycleId/call" -Method Post | Out-Null
+            $zero=$false
+            for($i=0;$i -lt 60;$i++){
+              $scale=Invoke-RestMethod "$b/api/scale/status"
+              if($scale.last_reading.stable -and [int64]$scale.last_reading.weight_kg -eq 0){$zero=$true;break}
+              Start-Sleep -Milliseconds 150
+            }
+            if(-not $zero){throw 'W100 second empty-deck proof missing'}
+
+            & $post '/sim/position' '{"exit_present":true,"safety_clear":true}' | Out-Null
+            & $post '/io/rfid' '{"tag":"RFID-DEMO-001","quality":99}' | Out-Null
+            & $post '/io/lpr' '{"plate":"15C-123.45","confidence":98}' | Out-Null
+            & $post '/sim/position' '{"front_present":true,"rear_present":true,"safety_clear":true}' | Out-Null
+            $complete=$false
+            for($i=0;$i -lt 90;$i++){
+              $wf=Invoke-RestMethod "$b/api/workflow"
+              if($wf.state -eq 'EXIT_AUTHORIZED' -and $wf.transaction.business_complete -and $wf.transaction.cycle_status -eq 'COMPLETE'){$complete=$true;break}
+              if($wf.state -eq 'FAULT_LOCKOUT'){throw "pass2 lockout: $($wf.transaction.last_block_reason)"}
+              Start-Sleep -Milliseconds 150
+            }
+            if(-not $complete){throw "W100 pair not COMPLETE: $($wf.state) $($wf.transaction.last_block_reason)"}
+            if([int64]$wf.transaction.accepted_weight.weight_kg -ne 11820){throw 'W100 pass2 tare mismatch'}
+            if(-not (Invoke-RestMethod "$b/api/audit/weights/verify").verified){throw 'W100 raw weight hash chain failed'}
+            $w=Invoke-RestMethod "$b/api/audit/weights?limit=5"
+            Write-Host ($w | ConvertTo-Json -Depth 5 -Compress).Substring(0,[Math]::Min(600,($w | ConvertTo-Json -Depth 5 -Compress).Length))
+            Write-Host 'W100 TWO-PASS PASS: RTU 28460 gross -> QUEUED -> CALLED -> 11820 tare -> COMPLETE; raw chain verified'
+          } finally {
+            if($p -and -not $p.HasExited){Stop-Process -Id $p.Id -Force}
+            if($sim -and -not $sim.HasExited){Stop-Process -Id $sim.Id -Force}
+          }
 
       - name: Bidirectional Modbus + two-pass hardware acceptance
         shell: pwsh

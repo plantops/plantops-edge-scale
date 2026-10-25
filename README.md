@@ -52,6 +52,15 @@ A physical pass may complete while the business cycle remains queued. An orphan,
 
 See `docs/TWO-PASS-CYCLE.md`.
 
+## Scale input
+
+| `-scale-driver` | Instrument | Line |
+|---|---|---|
+| `ascii` (default) | TCP text stream `WT=…;ST=…` | `-scale-addr host:port` |
+| `w100` | LAUMAS W100/W200, Modbus RTU, gross weight | `-scale-port COM5`, `/dev/ttyUSB0` or `tcp:host:port` |
+
+Bench guide with the W100 and a load cell simulator: `docs/W100-BENCH.md`.
+
 ## Safety and audit invariants
 
 ```text
