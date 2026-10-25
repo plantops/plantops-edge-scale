@@ -28,6 +28,7 @@ func main() {
 		keepEdge = flag.Bool("keep-edge", false, "leave the edge process running afterwards")
 		verbose  = flag.Bool("v", false, "log simulator events")
 		cfg      fleet.Config
+		bench    = flag.Bool("bench", false, "run the edge with every component set to adapter fake and drive its bench API (no Modbus/Laumas simulators)")
 		faults   = flag.Bool("faults", true, "inject RFID misses, LPR misreads and dropped scale polls")
 	)
 	flag.Float64Var(&cfg.Speed, "speed", 10, "simulated seconds per real second")
@@ -51,7 +52,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	opts := fleet.SiteOptions{Config: cfg, EdgeBinary: *edgeBin, WorkDir: *workDir, Timeout: *timeout, KeepEdge: *keepEdge}
+	opts := fleet.SiteOptions{Config: cfg, EdgeBinary: *edgeBin, WorkDir: *workDir, Timeout: *timeout, KeepEdge: *keepEdge, Bench: *bench}
 	if *verbose {
 		opts.Logf = func(f string, a ...any) { fmt.Fprintf(os.Stderr, "[sim] "+f+"\n", a...) }
 	}

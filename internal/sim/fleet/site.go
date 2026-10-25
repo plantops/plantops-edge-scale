@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/sim/laumassim"
@@ -25,26 +24,42 @@ type SiteOptions struct {
 	Timeout    time.Duration // overall limit for the run (real time)
 	ExtraEdge  []string      // extra edge flags, e.g. "-pair-require-gross-first"
 	KeepEdge   bool          // leave the edge process running at the end
+	// Bench runs the edge with every component set to adapter "fake" and drives it
+	// through its HTTP bench API instead of Modbus / Laumas simulators.
+	Bench bool
 }
 
 // EdgeArgs builds the edge flags that connect it to the simulated devices.
 func EdgeArgs(cfg Config, listen, scaleAddr, ioAddr, ticketURL, heartbeatURL, dir, vehicleMap string) []string {
 	cfg = cfg.withDefaults()
-	return []string{
+	return edgeArgs(cfg, false, listen, scaleAddr, ioAddr, ticketURL, heartbeatURL, dir, vehicleMap)
+}
+
+func edgeArgs(cfg Config, bench bool, listen, scaleAddr, ioAddr, ticketURL, heartbeatURL, dir, vehicleMap string) []string {
+	devices := []string{
+		"-scale-protocol", "laumas-rtu", "-scale-addr", scaleAddr, "-scale-slave", "1",
+		"-scale-response-timeout", "300ms", "-scale-reconnect-delay", "300ms",
+		"-io-addr", ioAddr, "-io-map", "safety_clear=8", "-io-buzzer-pulse", "50ms",
+	}
+	if bench {
+		devices = []string{
+			"-scale-protocol", "fake", "-io-adapter", "fake", "-rfid-adapter", "fake", "-lpr-adapter", "fake", "-camera-adapter", "fake",
+			"-fake-settle", "350ms", "-fake-barrier-delay", "150ms", "-io-buzzer-pulse", "50ms",
+			"-central-allow-simulated", // a simulator run may deliver to the mock Central
+		}
+	}
+	args := []string{
 		"-listen", listen,
 		"-station-id", "SIM-01",
 		"-db", filepath.Join(dir, "edge.db"),
 		"-raw-weight-journal", filepath.Join(dir, "raw-weight.jsonl"),
 		"-event-journal", filepath.Join(dir, "events.jsonl"),
-		"-scale-protocol", "laumas-rtu", "-scale-addr", scaleAddr, "-scale-slave", "1",
-		"-scale-poll", cfg.ScalePoll.String(), "-scale-response-timeout", "300ms",
-		"-scale-reconnect-delay", "300ms",
-		"-io-addr", ioAddr, "-io-map", "safety_clear=8", "-io-poll", cfg.IOPoll.String(),
-		"-io-buzzer-pulse", "50ms",
+		"-scale-poll", cfg.ScalePoll.String(), "-io-poll", cfg.IOPoll.String(),
 		"-vehicle-map", vehicleMap,
 		"-min-stable-weight-kg", "1000", "-stable-confirmations", "2", "-stable-tolerance-kg", "20",
 		"-central-ticket-url", ticketURL, "-central-heartbeat-url", heartbeatURL, "-central-sync-interval", "500ms",
 	}
+	return append(args, devices...)
 }
 
 func freeAddr() (string, error) {
@@ -85,19 +100,29 @@ func RunSite(ctx context.Context, o SiteOptions) (*Report, error) {
 		return nil, err
 	}
 
-	// Devices.
-	ind := laumassim.New(1)
-	scaleLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, err
+	// Devices. In bench mode there are none: the edge simulates them itself.
+	var (
+		ind      *laumassim.Indicator
+		slave    *modbusio.Slave
+		scaleLn  net.Listener
+		ioLn     net.Listener
+		err      error
+		scaleDev ScaleBackend
+		ioDev    IOBackend
+	)
+	if !o.Bench {
+		ind = laumassim.New(1)
+		if scaleLn, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
+			return nil, err
+		}
+		go func() { _ = ind.Serve(ctx, scaleLn) }()
+		slave = modbusio.New()
+		if ioLn, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
+			return nil, err
+		}
+		go func() { _ = slave.Serve(ctx, ioLn) }()
+		scaleDev, ioDev = ind, slave
 	}
-	go func() { _ = ind.Serve(ctx, scaleLn) }()
-	slave := modbusio.New()
-	ioLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, err
-	}
-	go func() { _ = slave.Serve(ctx, ioLn) }()
 	central, err := StartMockCentral(ctx, "127.0.0.1:0")
 	if err != nil {
 		return nil, err
@@ -109,9 +134,16 @@ func RunSite(ctx context.Context, o SiteOptions) (*Report, error) {
 
 	cfg := o.Config.withDefaults()
 	edge := NewEdgeClient("http://" + edgeAddr)
-	plant := NewPlant(cfg, edge, slave, ind, logf)
+	if o.Bench {
+		scaleDev, ioDev = NewBenchScale(edge), NewBenchIO(edge)
+	}
+	plant := NewPlant(cfg, edge, ioDev, scaleDev, logf)
 
-	args := EdgeArgs(cfg, edgeAddr, scaleLn.Addr().String(), ioLn.Addr().String(), central.TicketURL(), central.HeartbeatURL(), dir, VehicleMap(plant.Fleet()))
+	scaleAddr, ioAddr := "", ""
+	if !o.Bench {
+		scaleAddr, ioAddr = scaleLn.Addr().String(), ioLn.Addr().String()
+	}
+	args := edgeArgs(cfg, o.Bench, edgeAddr, scaleAddr, ioAddr, central.TicketURL(), central.HeartbeatURL(), dir, VehicleMap(plant.Fleet()))
 	args = append(args, o.ExtraEdge...)
 	cmd := exec.CommandContext(ctx, o.EdgeBinary, args...)
 	cmd.Stdout, cmd.Stderr = o.EdgeLog, o.EdgeLog
@@ -121,7 +153,7 @@ func RunSite(ctx context.Context, o SiteOptions) (*Report, error) {
 	if !o.KeepEdge {
 		defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
 	}
-	logf("edge pid %d on %s (scale %s, io %s, central %s)", cmd.Process.Pid, edgeAddr, scaleLn.Addr(), ioLn.Addr(), central.Addr)
+	logf("edge pid %d on %s (bench=%v scale %q io %q central %s)", cmd.Process.Pid, edgeAddr, o.Bench, scaleAddr, ioAddr, central.Addr)
 
 	if err := waitHealthy(ctx, edge); err != nil {
 		return nil, err
@@ -192,5 +224,3 @@ func waitScaleLive(ctx context.Context, edge *EdgeClient) error {
 	}
 	return fmt.Errorf("edge never connected to the simulated Laumas indicator")
 }
-
-var _ = strconv.Itoa

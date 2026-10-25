@@ -8,9 +8,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/sim/laumassim"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/sim/modbusio"
 )
+
+// IOBackend is the plant's view of the remote I/O module: the sensors it sets and
+// the lamp/barrier outputs it reads. The Modbus slave implements it directly; the
+// bench backend implements it over the edge's HTTP bench API.
+type IOBackend interface {
+	SetDI(addr int, on bool)
+	Coil(addr int) bool
+}
+
+// ScaleBackend is the plant's view of the weight indicator.
+type ScaleBackend interface {
+	SetWeight(kg int32, stable bool)
+	DropNext(n int) // dropped polls; a backend without that notion ignores it
+}
 
 // Expectation is what the sim knows to be true about one completed turn.
 type Expectation struct {
@@ -39,8 +52,8 @@ type Stats struct {
 type Plant struct {
 	cfg  Config
 	edge *EdgeClient
-	io   *modbusio.Slave
-	ind  *laumassim.Indicator
+	io   IOBackend
+	ind  ScaleBackend
 	logf func(string, ...any)
 
 	mu       sync.Mutex
@@ -56,7 +69,7 @@ type Plant struct {
 	stopped  bool
 }
 
-func NewPlant(cfg Config, edge *EdgeClient, io *modbusio.Slave, ind *laumassim.Indicator, logf func(string, ...any)) *Plant {
+func NewPlant(cfg Config, edge *EdgeClient, io IOBackend, ind ScaleBackend, logf func(string, ...any)) *Plant {
 	cfg = cfg.withDefaults()
 	if logf == nil {
 		logf = func(string, ...any) {}
