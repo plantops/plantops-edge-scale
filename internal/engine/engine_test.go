@@ -279,3 +279,72 @@ func TestTicketCommitFailurePreventsRelease(t *testing.T) {
 		t.Fatal("failed local commit must never authorize release")
 	}
 }
+
+// Regression found by the fleet simulator. The edge calls ClearFault(SCALE) on
+// every healthy scale frame; that re-evaluated identity and re-ran entry
+// authorisation without looking at the state. As soon as the truck left the deck
+// and the scale read empty, a transaction that had already been released
+// (EXIT_AUTHORIZED / EXITING) was dragged back to ENTRY_AUTHORIZED, re-opening
+// the entry lamp and barrier while the exit side was still open.
+func TestScaleFaultClearAfterReleaseNeverReauthorizesEntry(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		exitSeen   bool
+		wantStates []domain.WorkflowState
+	}{
+		{"truck gone from deck, exit sensor not yet reached", false, []domain.WorkflowState{domain.StateExitAuthorized}},
+		{"truck on the exit sensor", true, []domain.WorkflowState{domain.StateExiting}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			e := newTestEngine(&fakeTicketStore{})
+			at := beginIdentifiedTruck(t, e)
+			deck := domain.PositionSnapshot{FrontPresent: true, RearPresent: true, SafetyClear: true, Observed: at.Add(5 * time.Millisecond)}
+			if err := e.ObservePosition(ctx, deck); err != nil { t.Fatal(err) }
+			for i := uint64(0); i < 3; i++ {
+				if err := e.ObserveScale(ctx, audited(24000, true, 10+i, at.Add(time.Duration(10+i)*time.Millisecond))); err != nil { t.Fatal(err) }
+			}
+			if s := e.Snapshot(); s.State != domain.StateExitAuthorized || !s.Transaction.Outputs.ExitGreen {
+				t.Fatalf("setup: expected EXIT_AUTHORIZED with exit green, got %s %+v", s.State, s.Transaction.Outputs)
+			}
+
+			pos := domain.PositionSnapshot{ExitPresent: tc.exitSeen, SafetyClear: true, Observed: at.Add(50 * time.Millisecond)}
+			if err := e.ObservePosition(ctx, pos); err != nil { t.Fatal(err) }
+			// The deck is empty again and the scale reads zero, exactly as the
+			// live collector reports it, followed by its per-frame ClearFault.
+			if err := e.ObserveScale(ctx, audited(0, true, 20, at.Add(60*time.Millisecond))); err != nil { t.Fatal(err) }
+			for i := 0; i < 3; i++ {
+				if err := e.ClearFault(ctx, domain.DeviceScale); err != nil { t.Fatal(err) }
+			}
+
+			s := e.Snapshot()
+			ok := false
+			for _, w := range tc.wantStates { ok = ok || s.State == w }
+			if !ok {
+				t.Fatalf("released transaction was pulled back to %s, want %v", s.State, tc.wantStates)
+			}
+			if o := s.Transaction.Outputs; o.EntryGreen || o.EntryBarrierOpen {
+				t.Fatalf("entry permission re-granted after release: %+v", o)
+			}
+		})
+	}
+}
+
+// A truck whose identity is still being resolved must keep being authorised by
+// later identity evidence; the guard above must not break that path.
+func TestIdentityEvidenceStillAuthorizesEntryWhileIdentifying(t *testing.T) {
+	ctx := context.Background()
+	e := newTestEngine(&fakeTicketStore{})
+	now := time.Now().UTC()
+	if err := e.ObserveScale(ctx, audited(0, true, 1, now)); err != nil { t.Fatal(err) }
+	if err := e.ObservePosition(ctx, domain.PositionSnapshot{EntryPresent: true, SafetyClear: true, Observed: now.Add(time.Millisecond)}); err != nil { t.Fatal(err) }
+	start := e.Snapshot().Transaction.StartedAt
+	if err := e.ObserveRFID(ctx, domain.RFIDObservation{Tag: "RFID-1", Health: domain.HealthHealthy, Observed: start.Add(time.Millisecond)}); err != nil { t.Fatal(err) }
+	if s := e.Snapshot(); s.State == domain.StateEntryAuthorized {
+		t.Fatalf("RFID alone must not authorise entry, state=%s", s.State)
+	}
+	if err := e.ObserveLPR(ctx, domain.LPRObservation{Plate: "15C-123.45", Health: domain.HealthHealthy, Observed: start.Add(2 * time.Millisecond)}); err != nil { t.Fatal(err) }
+	if s := e.Snapshot(); s.State != domain.StateEntryAuthorized || !s.Transaction.Outputs.EntryGreen {
+		t.Fatalf("matching RFID+LPR must authorise entry, state=%s", s.State)
+	}
+}
