@@ -60,6 +60,7 @@ type Ticket struct {
 	GrossKG int64 `json:"gross_kg,omitempty"`
 	TareKG int64 `json:"tare_kg,omitempty"`
 	NetKG int64 `json:"net_kg,omitempty"`
+	Flow MaterialFlow `json:"flow,omitempty"`
 	FirstWeightObservedAt time.Time `json:"first_weight_observed_at,omitempty"`
 	SecondWeightObservedAt time.Time `json:"second_weight_observed_at,omitempty"`
 	FirstWeightRawRef RawWeightRef `json:"first_weight_raw_ref,omitempty"`

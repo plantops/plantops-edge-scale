@@ -54,13 +54,65 @@ func TestValidatePairRejectsExpiredPair(t *testing.T) {
 	}
 }
 
-func TestValidatePairRejectsNonPositiveNet(t *testing.T) {
+func TestValidatePairRejectsEqualWeights(t *testing.T) {
 	t0 := time.Now().UTC()
 	first := passForTest(PassFirst, DirectionAToB, "15C-1", 10000, t0, 1)
-	second := passForTest(PassSecond, DirectionBToA, "15C-1", 11000, t0.Add(time.Hour), 2)
+	second := passForTest(PassSecond, DirectionBToA, "15C-1", 10000, t0.Add(time.Hour), 2)
 	got := ValidatePair(first, second, PairPolicy{})
-	if got.Status != CyclePairWeightInvalid {
-		t.Fatalf("expected PAIR_WEIGHT_INVALID, got %+v", got)
+	if got.Valid || got.Status != CyclePairWeightInvalid {
+		t.Fatalf("equal weights carry no net and must be PAIR_WEIGHT_INVALID, got %+v", got)
+	}
+}
+
+func TestValidatePairGrossFirstIsMaterialIn(t *testing.T) {
+	t0 := time.Now().UTC()
+	first := passForTest(PassFirst, DirectionAToB, "15C-1", 28460, t0, 1)
+	second := passForTest(PassSecond, DirectionBToA, "15C-1", 9300, t0.Add(20*time.Minute), 2)
+	got := ValidatePair(first, second, PairPolicy{})
+	if !got.Valid || got.Flow != FlowMaterialIn || got.GrossKG != 28460 || got.TareKG != 9300 || got.NetKG != 19160 {
+		t.Fatalf("gross-first pair wrong: %+v", got)
+	}
+}
+
+// Outbound material: the truck crosses empty (tare) on A->B, is loaded at the
+// store, and crosses loaded (gross) on B->A. The physical directions stay the
+// same; only the weight roles swap.
+func TestValidatePairTareFirstIsMaterialOut(t *testing.T) {
+	t0 := time.Now().UTC()
+	first := passForTest(PassFirst, DirectionAToB, "15C-1", 9100, t0, 1)
+	second := passForTest(PassSecond, DirectionBToA, "15C-1", 27000, t0.Add(20*time.Minute), 2)
+	got := ValidatePair(first, second, PairPolicy{})
+	if !got.Valid || got.Status != CycleComplete || got.Flow != FlowMaterialOut {
+		t.Fatalf("tare-first pair must be valid MATERIAL_OUT: %+v", got)
+	}
+	if got.GrossKG != 27000 || got.TareKG != 9100 || got.NetKG != 17900 {
+		t.Fatalf("gross/tare roles must follow the weights, got gross=%d tare=%d net=%d", got.GrossKG, got.TareKG, got.NetKG)
+	}
+}
+
+func TestValidatePairRequireGrossFirstRestoresLegacyRule(t *testing.T) {
+	t0 := time.Now().UTC()
+	first := passForTest(PassFirst, DirectionAToB, "15C-1", 9100, t0, 1)
+	second := passForTest(PassSecond, DirectionBToA, "15C-1", 27000, t0.Add(20*time.Minute), 2)
+	got := ValidatePair(first, second, PairPolicy{RequireGrossFirst: true})
+	if got.Valid || got.Status != CyclePairWeightInvalid {
+		t.Fatalf("legacy policy must reject tare-first, got %+v", got)
+	}
+}
+
+// Configured ranges bind the heavier weight as gross and the lighter as tare
+// regardless of which pass produced them.
+func TestValidatePairRangesFollowRoleNotPassOrder(t *testing.T) {
+	t0 := time.Now().UTC()
+	first := passForTest(PassFirst, DirectionAToB, "15C-1", 9100, t0, 1)
+	second := passForTest(PassSecond, DirectionBToA, "15C-1", 27000, t0.Add(20*time.Minute), 2)
+	policy := PairPolicy{MinTareKG: 8000, MaxTareKG: 10000, MinGrossKG: 20000, MaxGrossKG: 40000}
+	if got := ValidatePair(first, second, policy); !got.Valid {
+		t.Fatalf("tare-first within role ranges must be valid: %+v", got)
+	}
+	policy.MaxTareKG = 9000 // the 9100 kg first pass is the TARE and now exceeds the limit
+	if got := ValidatePair(first, second, policy); got.Valid {
+		t.Fatalf("tare range must be applied to the lighter (first) pass: %+v", got)
 	}
 }
 

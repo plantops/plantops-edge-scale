@@ -48,11 +48,11 @@ func (c *Coordinator) RecordSecondPass(ctx context.Context,pass domain.WeighPass
 		if validation.Status!=domain.CycleWrongTruck{_ = c.store.MarkCycleStatus(ctx,open.ID,domain.CycleCalled,validation.Reason,c.now())}
 		return open,domain.Ticket{},fmt.Errorf("%w: %s",ErrInvalidPair,validation.Reason)
 	}
-	now:=c.now();open.SecondPass=&pass;open.Status=domain.CycleComplete;open.PairElapsed=validation.Elapsed;open.GrossKG=validation.GrossKG;open.TareKG=validation.TareKG;open.NetKG=validation.NetKG;open.CompletedAt=&now;open.LastBlockReason=""
+	now:=c.now();open.SecondPass=&pass;open.Status=domain.CycleComplete;open.PairElapsed=validation.Elapsed;open.GrossKG=validation.GrossKG;open.TareKG=validation.TareKG;open.NetKG=validation.NetKG;open.Flow=validation.Flow;open.CompletedAt=&now;open.LastBlockReason=""
 	camera:=append([]domain.CameraEvidence{},open.FirstPass.CameraEvidence...);camera=append(camera,pass.CameraEvidence...)
 	ticket:=domain.Ticket{ID:c.newID("ticket"),StationID:open.StationID,TransactionID:open.ID,CycleID:open.ID,Plate:open.Plate,RFID:open.RFID,Mode:combineMode(open.FirstPass.Mode,pass.Mode),Overrides:append(append([]domain.Override{},open.FirstPass.Overrides...),pass.Overrides...),CameraEvidence:camera,CommittedAt:now}
 	if err:=c.store.CompleteCycle(ctx,open,ticket);err!=nil{return open,domain.Ticket{},err}
-	ticket.FirstPassID=open.FirstPass.ID;ticket.SecondPassID=pass.ID;ticket.GrossKG=open.GrossKG;ticket.TareKG=open.TareKG;ticket.NetKG=open.NetKG;ticket.FirstWeightObservedAt=open.FirstPass.Weight.ObservedAt;ticket.SecondWeightObservedAt=pass.Weight.ObservedAt;ticket.FirstWeightRawRef=open.FirstPass.Weight.RawRef;ticket.SecondWeightRawRef=pass.Weight.RawRef;ticket.PairElapsedSeconds=int64(open.PairElapsed/time.Second)
+	ticket.FirstPassID=open.FirstPass.ID;ticket.SecondPassID=pass.ID;ticket.GrossKG=open.GrossKG;ticket.TareKG=open.TareKG;ticket.NetKG=open.NetKG;ticket.Flow=open.Flow;ticket.FirstWeightObservedAt=open.FirstPass.Weight.ObservedAt;ticket.SecondWeightObservedAt=pass.Weight.ObservedAt;ticket.FirstWeightRawRef=open.FirstPass.Weight.RawRef;ticket.SecondWeightRawRef=pass.Weight.RawRef;ticket.PairElapsedSeconds=int64(open.PairElapsed/time.Second)
 	return open,ticket,nil
 }
 

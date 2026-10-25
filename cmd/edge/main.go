@@ -50,6 +50,7 @@ type config struct {
 	pairMinElapsed, pairMaxElapsed time.Duration
 	pairMinGrossKG, pairMaxGrossKG, pairMinTareKG, pairMaxTareKG int64
 	pairMinNetKG, pairMaxNetKG int64
+	pairRequireGrossFirst bool
 	centralTicketURL, centralHeartbeatURL, centralToken string
 	centralSyncInterval, centralHeartbeatInterval, centralTimeout time.Duration
 	simulation bool
@@ -89,10 +90,11 @@ func parseFlags() (config, string) {
 	flag.Int64Var(&c.stableToleranceKG,"stable-tolerance-kg",20,"maximum delta between stable confirmation frames")
 	flag.DurationVar(&c.pairMinElapsed,"pair-min-elapsed",0,"minimum valid elapsed time between A->B and B->A; 0 disables")
 	flag.DurationVar(&c.pairMaxElapsed,"pair-max-elapsed",0,"maximum valid elapsed time between A->B and B->A; 0 disables expiry")
-	flag.Int64Var(&c.pairMinGrossKG,"pair-min-gross-kg",0,"minimum valid first/gross weight; 0 disables")
-	flag.Int64Var(&c.pairMaxGrossKG,"pair-max-gross-kg",0,"maximum valid first/gross weight; 0 disables")
-	flag.Int64Var(&c.pairMinTareKG,"pair-min-tare-kg",0,"minimum valid second/tare weight; 0 disables")
-	flag.Int64Var(&c.pairMaxTareKG,"pair-max-tare-kg",0,"maximum valid second/tare weight; 0 disables")
+	flag.BoolVar(&c.pairRequireGrossFirst,"pair-require-gross-first",false,"legacy inbound-only rule: reject a pair whose second pass is heavier than the first; default accepts tare-first (material OUT) trips")
+	flag.Int64Var(&c.pairMinGrossKG,"pair-min-gross-kg",0,"minimum valid gross (heavier pass) weight; 0 disables")
+	flag.Int64Var(&c.pairMaxGrossKG,"pair-max-gross-kg",0,"maximum valid gross (heavier pass) weight; 0 disables")
+	flag.Int64Var(&c.pairMinTareKG,"pair-min-tare-kg",0,"minimum valid tare (lighter pass) weight; 0 disables")
+	flag.Int64Var(&c.pairMaxTareKG,"pair-max-tare-kg",0,"maximum valid tare (lighter pass) weight; 0 disables")
 	flag.Int64Var(&c.pairMinNetKG,"pair-min-net-kg",0,"minimum valid gross-tare net weight; 0 disables")
 	flag.Int64Var(&c.pairMaxNetKG,"pair-max-net-kg",0,"maximum valid gross-tare net weight; 0 disables")
 	flag.StringVar(&c.centralTicketURL,"central-ticket-url","","Central completed-ticket POST endpoint; empty disables ticket sync")
@@ -127,7 +129,7 @@ func run(ctx context.Context, c config) error {
 	store,err:=sqlitestore.Open(c.dbPath);if err!=nil{return fmt.Errorf("SQLite edge store: %w",err)};defer store.Close()
 	if st,err:=store.Status(ctx);err!=nil{return fmt.Errorf("SQLite edge store integrity: %w",err)}else{log.Printf("SQLite ready path=%s schema=%d tickets=%d queued=%d called=%d completed_cycles=%d pending_sync=%d",st.Path,st.Schema,st.Tickets,st.QueuedCycles,st.CalledCycles,st.CompletedCycles,st.PendingSync)}
 
-	pairPolicy:=domain.PairPolicy{MinElapsed:c.pairMinElapsed,MaxElapsed:c.pairMaxElapsed,MinGrossKG:c.pairMinGrossKG,MaxGrossKG:c.pairMaxGrossKG,MinTareKG:c.pairMinTareKG,MaxTareKG:c.pairMaxTareKG,MinNetKG:c.pairMinNetKG,MaxNetKG:c.pairMaxNetKG}
+	pairPolicy:=domain.PairPolicy{RequireGrossFirst:c.pairRequireGrossFirst,MinElapsed:c.pairMinElapsed,MaxElapsed:c.pairMaxElapsed,MinGrossKG:c.pairMinGrossKG,MaxGrossKG:c.pairMaxGrossKG,MinTareKG:c.pairMinTareKG,MaxTareKG:c.pairMaxTareKG,MinNetKG:c.pairMinNetKG,MaxNetKG:c.pairMaxNetKG}
 	cycleCoordinator:=cycle.New(store,pairPolicy);commitBridge:=twopass.NewCommitBridge(cycleCoordinator)
 	vehicleRegistry,err:=registry.Parse(c.vehicleMap);if err!=nil{return fmt.Errorf("vehicle map: %w",err)}
 	innerWorkflow:=engine.New(engine.Config{StationID:c.stationID,EmptyScaleMaxKG:c.emptyScaleMaxKG,MinStableWeightKG:c.minStableWeightKG,StableConfirmations:c.stableConfirmations,StableToleranceKG:c.stableToleranceKG},commitBridge,vehicleRegistry)
