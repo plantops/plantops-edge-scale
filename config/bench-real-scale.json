@@ -1,0 +1,32 @@
+{
+  "station_id": "BENCH-01",
+  "listen": "127.0.0.1:8080",
+  "storage": {
+    "db": "data/bench/edge.db",
+    "raw_weight_journal": "data/bench/raw-weight.jsonl",
+    "event_journal": "data/bench/events.jsonl"
+  },
+
+  "scale": {
+    "adapter": "laumas-rtu",
+    "serial": "COM3",
+    "baud": 9600,
+    "parity": "N",
+    "stop_bits": 1,
+    "slave": 1,
+    "poll_ms": 100,
+    "response_timeout_ms": 300,
+    "missed_polls": 3
+  },
+
+  "io":      { "adapter": "fake", "barrier_delay_ms": 800 },
+  "rfid":    { "adapter": "fake" },
+  "lpr":     { "adapter": "fake" },
+  "cameras": { "adapter": "fake", "ids": ["C1A", "C1B", "C3"] },
+
+  "vehicles": {
+    "E2001111AAAA": "61C-123.45",
+    "E2002222BBBB": "51D-678.90",
+    "E2003333CCCC": "60H-555.21"
+  }
+}

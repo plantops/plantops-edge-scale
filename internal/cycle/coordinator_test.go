@@ -40,6 +40,45 @@ func TestBusinessCycleFirstQueueCallSecondNetComplete(t *testing.T) {
 	}
 }
 
+func TestTareFirstOutboundCycleCompletesWithFlow(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "edge.db"))
+	if err != nil { t.Fatal(err) }
+	defer store.Close()
+	c := New(store, domain.PairPolicy{MaxElapsed: 4*time.Hour, MinNetKG: 1000})
+
+	t0 := time.Date(2026,8,21,1,0,0,0,time.UTC)
+	open, err := c.RecordFirstPass(ctx, pass(domain.DirectionAToB, "61C-123.45", "RFID-9", 9100, t0, 11))
+	if err != nil { t.Fatal(err) }
+	if err := c.Call(ctx, open.ID); err != nil { t.Fatal(err) }
+	done, ticket, err := c.RecordSecondPass(ctx, pass(domain.DirectionBToA, "61C12345", "RFID-9", 27000, t0.Add(18*time.Minute), 22))
+	if err != nil { t.Fatalf("tare-first outbound trip must complete: %v", err) }
+	if done.Flow != domain.FlowMaterialOut || ticket.Flow != domain.FlowMaterialOut {
+		t.Fatalf("flow not MATERIAL_OUT: cycle=%q ticket=%q", done.Flow, ticket.Flow)
+	}
+	if ticket.GrossKG != 27000 || ticket.TareKG != 9100 || ticket.NetKG != 17900 {
+		t.Fatalf("gross/tare roles wrong: %+v", ticket)
+	}
+}
+
+func TestRequireGrossFirstPolicyRejectsTareFirstAndKeepsCycleCalled(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "edge.db"))
+	if err != nil { t.Fatal(err) }
+	defer store.Close()
+	c := New(store, domain.PairPolicy{RequireGrossFirst: true})
+
+	t0 := time.Now().UTC()
+	open, err := c.RecordFirstPass(ctx, pass(domain.DirectionAToB, "61C-1", "R1", 9100, t0, 1))
+	if err != nil { t.Fatal(err) }
+	if err := c.Call(ctx, open.ID); err != nil { t.Fatal(err) }
+	if _, _, err := c.RecordSecondPass(ctx, pass(domain.DirectionBToA, "61C-1", "R1", 27000, t0.Add(time.Minute), 2)); !errors.Is(err, ErrInvalidPair) {
+		t.Fatalf("legacy policy must reject tare-first with ErrInvalidPair, got %v", err)
+	}
+	st, _ := store.Status(ctx)
+	if st.Tickets != 0 || st.CalledCycles != 1 { t.Fatalf("rejected pair must leave cycle CALLED and create no ticket: %+v", st) }
+}
+
 func TestReturnTruckMustMatchCalledCycle(t *testing.T) {
 	ctx := context.Background()
 	store, err := sqlitestore.Open(filepath.Join(t.TempDir(), "edge.db"))

@@ -33,6 +33,32 @@ const (
 	CycleWrongTruck        CycleStatus = "WRONG_TRUCK"
 )
 
+// MaterialFlow says which way the goods moved across the weighbridge. It is
+// derived from the two weights, never from the physical pass direction: pass 1
+// is always A_TO_B and pass 2 always B_TO_A.
+//
+//	MATERIAL_IN  first pass heavier  (loaded in on A->B, empty back on B->A)
+//	MATERIAL_OUT first pass lighter  (empty in on A->B, loaded back on B->A)
+type MaterialFlow string
+
+const (
+	FlowMaterialIn  MaterialFlow = "MATERIAL_IN"
+	FlowMaterialOut MaterialFlow = "MATERIAL_OUT"
+)
+
+// FlowOf derives the material flow from the two accepted weights. Equal weights
+// carry no net and therefore no flow.
+func FlowOf(firstKG, secondKG int64) MaterialFlow {
+	switch {
+	case firstKG > secondKG:
+		return FlowMaterialIn
+	case secondKG > firstKG:
+		return FlowMaterialOut
+	default:
+		return ""
+	}
+}
+
 type CameraEvidence struct {
 	CameraID   string    `json:"camera_id"`
 	Role       string    `json:"role,omitempty"`
@@ -75,12 +101,20 @@ type WeighCycle struct {
 	GrossKG        int64        `json:"gross_kg,omitempty"`
 	TareKG         int64        `json:"tare_kg,omitempty"`
 	NetKG          int64        `json:"net_kg,omitempty"`
+	Flow           MaterialFlow `json:"flow,omitempty"`
 	LastBlockReason string      `json:"last_block_reason,omitempty"`
 }
 
 // PairPolicy is business/master-data configuration. Zero-valued limits mean
 // "not configured"; the workflow must not hide site-specific limits in code.
+//
+// MinGross/MaxGross apply to the heavier of the two weights and MinTare/MaxTare
+// to the lighter one, whichever pass produced them.
 type PairPolicy struct {
+	// RequireGrossFirst restores the legacy inbound-only rule: pass 1 must be the
+	// heavier weight. Leave false to accept tare-first (material OUT) trips too.
+	RequireGrossFirst bool `json:"require_gross_first"`
+
 	MinElapsed time.Duration `json:"min_elapsed"`
 	MaxElapsed time.Duration `json:"max_elapsed"`
 	MinGrossKG int64         `json:"min_gross_kg"`
@@ -99,6 +133,7 @@ type PairValidation struct {
 	GrossKG int64         `json:"gross_kg"`
 	TareKG  int64         `json:"tare_kg"`
 	NetKG   int64         `json:"net_kg"`
+	Flow    MaterialFlow  `json:"flow,omitempty"`
 }
 
 func ValidatePair(first, second WeighPass, policy PairPolicy) PairValidation {
@@ -107,6 +142,11 @@ func ValidatePair(first, second WeighPass, policy PairPolicy) PairValidation {
 		Status: CyclePairWeightInvalid,
 		GrossKG: first.Weight.WeightKG,
 		TareKG: second.Weight.WeightKG,
+		Flow: FlowOf(first.Weight.WeightKG, second.Weight.WeightKG),
+	}
+	// Roles follow the weights: gross is the heavier pass, tare the lighter one.
+	if out.Flow == FlowMaterialOut {
+		out.GrossKG, out.TareKG = second.Weight.WeightKG, first.Weight.WeightKG
 	}
 	out.NetKG = out.GrossKG - out.TareKG
 	out.Elapsed = second.Weight.ObservedAt.Sub(first.Weight.ObservedAt)
@@ -148,7 +188,10 @@ func ValidatePair(first, second WeighPass, policy PairPolicy) PairValidation {
 		return invalid(CyclePairWeightInvalid, "tare weight outside configured range")
 	}
 	if out.NetKG <= 0 {
-		return invalid(CyclePairWeightInvalid, "current inbound/unload cycle requires gross weight greater than tare weight")
+		return invalid(CyclePairWeightInvalid, "net weight must be positive: the two pass weights are equal")
+	}
+	if policy.RequireGrossFirst && out.Flow == FlowMaterialOut {
+		return invalid(CyclePairWeightInvalid, "policy requires gross first: second pass is heavier than first")
 	}
 	if !withinConfigured(out.NetKG, policy.MinNetKG, policy.MaxNetKG) {
 		return invalid(CyclePairWeightInvalid, "net weight outside configured range")

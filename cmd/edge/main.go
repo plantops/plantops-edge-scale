@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,12 +10,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/auditjournal"
+	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/fakeio"
+	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/fakescale"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/ingress"
+	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/laumasrtu"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/modbustcp"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/rawjournal"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/registry"
@@ -26,6 +31,7 @@ import (
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/engine"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/httpapi"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/runtimeio"
+	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/siteconfig"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/twopass"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/winservice"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/workflowaudit"
@@ -50,9 +56,24 @@ type config struct {
 	pairMinElapsed, pairMaxElapsed time.Duration
 	pairMinGrossKG, pairMaxGrossKG, pairMinTareKG, pairMaxTareKG int64
 	pairMinNetKG, pairMaxNetKG int64
+	pairRequireGrossFirst bool
+	scaleProtocol, scaleSerial, scaleParity string
+	scaleBaud, scaleStopBits int
+	scaleSlave uint
+	scalePoll, scaleResponseTimeout time.Duration
+	scaleMissedPolls int
+	laumasStableBit int
+	laumasOverloadMask, laumasFaultMask uint
 	centralTicketURL, centralHeartbeatURL, centralToken string
 	centralSyncInterval, centralHeartbeatInterval, centralTimeout time.Duration
 	simulation bool
+
+	// Per-component hardware selection (see internal/siteconfig).
+	configPath                                string
+	ioAdapter, rfidAdapter, lprAdapter, cameraAdapter string
+	fakeSettle, fakeBarrierDelay              time.Duration
+	fakeSafetyClear                           bool
+	centralAllowSimulated                     bool
 }
 
 func main() {
@@ -73,6 +94,27 @@ func parseFlags() (config, string) {
 	flag.StringVar(&c.scaleAddr,"scale-addr","","scale controller TCP address host:port; empty disables live collector")
 	flag.StringVar(&c.rawWeightJournal,"raw-weight-journal","data/raw-weight.jsonl","append-only raw weight audit journal path")
 	flag.StringVar(&c.eventJournal,"event-journal","data/events.jsonl","append-only operational event audit journal path")
+	flag.StringVar(&c.configPath,"config","","JSON site configuration; every flag given explicitly overrides it (see docs/HARDWARE-CONFIG.md)")
+	flag.StringVar(&c.scaleProtocol,"scale-protocol","","scale adapter: none, ascii (TCP line stream, placeholder), laumas-rtu (Laumas W100/W200 Modbus RTU poll) or fake; default: ascii when -scale-addr is set, else none")
+	flag.StringVar(&c.ioAdapter,"io-adapter","","remote I/O adapter: none, modbustcp or fake; default: modbustcp when -io-addr is set, else none")
+	flag.StringVar(&c.rfidAdapter,"rfid-adapter","webhook","RFID adapter: webhook (the real reader POSTs /io/rfid) or fake (bench panel)")
+	flag.StringVar(&c.lprAdapter,"lpr-adapter","webhook","plate camera adapter: webhook (the real camera POSTs /io/lpr) or fake (bench panel)")
+	flag.StringVar(&c.cameraAdapter,"camera-adapter","webhook","evidence camera adapter: webhook or fake")
+	flag.DurationVar(&c.fakeSettle,"fake-settle",700*time.Millisecond,"fake scale: time after a weight change before it reads STABLE")
+	flag.DurationVar(&c.fakeBarrierDelay,"fake-barrier-delay",800*time.Millisecond,"fake I/O: time a barrier takes to travel")
+	flag.BoolVar(&c.fakeSafetyClear,"fake-safety-clear",true,"fake I/O: initial physical-safety-clear input")
+	flag.BoolVar(&c.centralAllowSimulated,"central-allow-simulated",false,"deliver tickets to Central even though some components are simulated (default: blocked)")
+	flag.StringVar(&c.scaleSerial,"scale-serial","","laumas-rtu: native COM port, e.g. COM3 (Windows). Empty = use -scale-addr as a serial-gateway TCP address")
+	flag.IntVar(&c.scaleBaud,"scale-baud",9600,"laumas-rtu serial baud rate")
+	flag.StringVar(&c.scaleParity,"scale-parity","N","laumas-rtu serial parity: N, E or O")
+	flag.IntVar(&c.scaleStopBits,"scale-stop-bits",1,"laumas-rtu serial stop bits: 1 or 2")
+	flag.UintVar(&c.scaleSlave,"scale-slave",1,"laumas-rtu Modbus slave address 1..247")
+	flag.DurationVar(&c.scalePoll,"scale-poll",100*time.Millisecond,"laumas-rtu poll interval (every poll is one raw-journal record)")
+	flag.DurationVar(&c.scaleResponseTimeout,"scale-response-timeout",300*time.Millisecond,"laumas-rtu per-poll response timeout")
+	flag.IntVar(&c.scaleMissedPolls,"scale-missed-polls",3,"laumas-rtu consecutive missed/damaged polls before the scale fault is raised")
+	flag.IntVar(&c.laumasStableBit,"laumas-stable-bit",-1,"laumas-rtu status bit meaning STABLE; -1 = verified default (bit 11)")
+	flag.UintVar(&c.laumasOverloadMask,"laumas-overload-mask",0,"laumas-rtu status mask meaning OVERLOAD; 0 = not decoded (verify against the manual first)")
+	flag.UintVar(&c.laumasFaultMask,"laumas-fault-mask",0,"laumas-rtu status mask meaning indicator FAULT; 0 = not decoded (verify against the manual first)")
 	flag.DurationVar(&c.reconnectDelay,"scale-reconnect-delay",2*time.Second,"delay before reconnecting to scale controller")
 	flag.StringVar(&c.ioAddr,"io-addr","","Modbus TCP remote I/O host:port; empty disables hardware I/O")
 	flag.UintVar(&c.ioUnitID,"io-unit-id",1,"Modbus TCP unit identifier 0..255")
@@ -89,10 +131,11 @@ func parseFlags() (config, string) {
 	flag.Int64Var(&c.stableToleranceKG,"stable-tolerance-kg",20,"maximum delta between stable confirmation frames")
 	flag.DurationVar(&c.pairMinElapsed,"pair-min-elapsed",0,"minimum valid elapsed time between A->B and B->A; 0 disables")
 	flag.DurationVar(&c.pairMaxElapsed,"pair-max-elapsed",0,"maximum valid elapsed time between A->B and B->A; 0 disables expiry")
-	flag.Int64Var(&c.pairMinGrossKG,"pair-min-gross-kg",0,"minimum valid first/gross weight; 0 disables")
-	flag.Int64Var(&c.pairMaxGrossKG,"pair-max-gross-kg",0,"maximum valid first/gross weight; 0 disables")
-	flag.Int64Var(&c.pairMinTareKG,"pair-min-tare-kg",0,"minimum valid second/tare weight; 0 disables")
-	flag.Int64Var(&c.pairMaxTareKG,"pair-max-tare-kg",0,"maximum valid second/tare weight; 0 disables")
+	flag.BoolVar(&c.pairRequireGrossFirst,"pair-require-gross-first",false,"legacy inbound-only rule: reject a pair whose second pass is heavier than the first; default accepts tare-first (material OUT) trips")
+	flag.Int64Var(&c.pairMinGrossKG,"pair-min-gross-kg",0,"minimum valid gross (heavier pass) weight; 0 disables")
+	flag.Int64Var(&c.pairMaxGrossKG,"pair-max-gross-kg",0,"maximum valid gross (heavier pass) weight; 0 disables")
+	flag.Int64Var(&c.pairMinTareKG,"pair-min-tare-kg",0,"minimum valid tare (lighter pass) weight; 0 disables")
+	flag.Int64Var(&c.pairMaxTareKG,"pair-max-tare-kg",0,"maximum valid tare (lighter pass) weight; 0 disables")
 	flag.Int64Var(&c.pairMinNetKG,"pair-min-net-kg",0,"minimum valid gross-tare net weight; 0 disables")
 	flag.Int64Var(&c.pairMaxNetKG,"pair-max-net-kg",0,"maximum valid gross-tare net weight; 0 disables")
 	flag.StringVar(&c.centralTicketURL,"central-ticket-url","","Central completed-ticket POST endpoint; empty disables ticket sync")
@@ -104,10 +147,126 @@ func parseFlags() (config, string) {
 	flag.BoolVar(&c.simulation,"simulation",false,"enable explicit /sim/* test ingress endpoints")
 	flag.StringVar(&serviceAction,"service","","Windows Service action: install|start|stop|status|uninstall")
 	flag.Parse()
+	if c.configPath != "" {
+		f, err := siteconfig.Load(c.configPath)
+		if err != nil { log.Fatalf("site config: %v", err) }
+		explicit := map[string]bool{}
+		flag.Visit(func(fl *flag.Flag) { explicit[fl.Name] = true })
+		applySiteFile(&c, f, explicit)
+	}
+	if err := resolveAdapters(&c); err != nil { log.Fatal(err) }
 	if c.ioUnitID > 255 { log.Fatal("io-unit-id must be 0..255") }
 	if c.pairMinElapsed < 0 || c.pairMaxElapsed < 0 { log.Fatal("pair elapsed limits cannot be negative") }
 	if c.pairMaxElapsed > 0 && c.pairMinElapsed > c.pairMaxElapsed { log.Fatal("pair-min-elapsed cannot exceed pair-max-elapsed") }
 	return c, serviceAction
+}
+
+// applySiteFile copies the file's settings into c unless the matching flag was
+// given explicitly. Only values that the file actually states are applied.
+func applySiteFile(c *config, f siteconfig.File, explicit map[string]bool) {
+	str := func(flagName string, dst *string, v string) { if v != "" && !explicit[flagName] { *dst = v } }
+	num := func(flagName string, dst *int, v int) { if v != 0 && !explicit[flagName] { *dst = v } }
+	ms := func(flagName string, dst *time.Duration, v int) { if v > 0 && !explicit[flagName] { *dst = time.Duration(v) * time.Millisecond } }
+	str("station-id", &c.stationID, f.StationID)
+	str("listen", &c.listen, f.Listen)
+	str("db", &c.dbPath, f.Storage.DB)
+	str("raw-weight-journal", &c.rawWeightJournal, f.Storage.RawWeightJournal)
+	str("event-journal", &c.eventJournal, f.Storage.EventJournal)
+
+	str("scale-protocol", &c.scaleProtocol, f.Scale.Adapter)
+	str("scale-addr", &c.scaleAddr, f.Scale.Addr)
+	str("scale-serial", &c.scaleSerial, f.Scale.Serial)
+	num("scale-baud", &c.scaleBaud, f.Scale.Baud)
+	str("scale-parity", &c.scaleParity, f.Scale.Parity)
+	num("scale-stop-bits", &c.scaleStopBits, f.Scale.StopBits)
+	if f.Scale.Slave != 0 && !explicit["scale-slave"] { c.scaleSlave = f.Scale.Slave }
+	ms("scale-poll", &c.scalePoll, f.Scale.PollMS)
+	ms("scale-response-timeout", &c.scaleResponseTimeout, f.Scale.ResponseTimeoutMS)
+	num("scale-missed-polls", &c.scaleMissedPolls, f.Scale.MissedPolls)
+	if f.Scale.StableBit != nil && !explicit["laumas-stable-bit"] { c.laumasStableBit = *f.Scale.StableBit }
+	if f.Scale.OverloadMask != 0 && !explicit["laumas-overload-mask"] { c.laumasOverloadMask = f.Scale.OverloadMask }
+	if f.Scale.FaultMask != 0 && !explicit["laumas-fault-mask"] { c.laumasFaultMask = f.Scale.FaultMask }
+	ms("fake-settle", &c.fakeSettle, f.Scale.SettleMS)
+
+	str("io-adapter", &c.ioAdapter, f.IO.Adapter)
+	str("io-addr", &c.ioAddr, f.IO.Addr)
+	if f.IO.UnitID != 0 && !explicit["io-unit-id"] { c.ioUnitID = f.IO.UnitID }
+	str("io-map", &c.ioMapSpec, f.IO.Map)
+	ms("io-poll", &c.ioPoll, f.IO.PollMS)
+	ms("io-timeout", &c.ioTimeout, f.IO.TimeoutMS)
+	ms("fake-barrier-delay", &c.fakeBarrierDelay, f.IO.BarrierDelayMS)
+	if f.IO.SafetyClearFixed != nil && !explicit["fake-safety-clear"] { c.fakeSafetyClear = *f.IO.SafetyClearFixed }
+
+	str("rfid-adapter", &c.rfidAdapter, f.RFID.Adapter)
+	str("lpr-adapter", &c.lprAdapter, f.LPR.Adapter)
+	str("camera-adapter", &c.cameraAdapter, f.Cameras.Adapter)
+	if len(f.Cameras.IDs) > 0 && !explicit["camera-ids"] { c.cameraIDs = strings.Join(f.Cameras.IDs, ",") }
+
+	if len(f.Vehicles) > 0 && !explicit["vehicle-map"] {
+		pairs := make([]string, 0, len(f.Vehicles))
+		for tag, plate := range f.Vehicles { pairs = append(pairs, tag+"="+plate) }
+		sort.Strings(pairs)
+		c.vehicleMap = strings.Join(pairs, ",")
+	}
+	str("central-ticket-url", &c.centralTicketURL, f.Central.TicketURL)
+	str("central-heartbeat-url", &c.centralHeartbeatURL, f.Central.HeartbeatURL)
+	str("central-token", &c.centralToken, f.Central.Token)
+	if f.Central.AllowSimulated && !explicit["central-allow-simulated"] { c.centralAllowSimulated = true }
+}
+
+// resolveAdapters fills in defaults and refuses inconsistent hardware settings
+// at start-up, not at the first truck.
+func resolveAdapters(c *config) error {
+	if c.scaleProtocol == "" {
+		c.scaleProtocol = siteconfig.AdapterNone
+		if c.scaleAddr != "" { c.scaleProtocol = siteconfig.AdapterASCII }
+	}
+	if c.ioAdapter == "" {
+		c.ioAdapter = siteconfig.AdapterNone
+		if c.ioAddr != "" { c.ioAdapter = siteconfig.AdapterModbusTCP }
+	}
+	for _, chk := range []struct{ comp siteconfig.Component; v string }{
+		{siteconfig.CompScale, c.scaleProtocol}, {siteconfig.CompIO, c.ioAdapter},
+		{siteconfig.CompRFID, c.rfidAdapter}, {siteconfig.CompLPR, c.lprAdapter}, {siteconfig.CompCameras, c.cameraAdapter},
+	} {
+		if err := siteconfig.Check(chk.comp, chk.v); err != nil { return err }
+	}
+	switch c.scaleProtocol {
+	case siteconfig.AdapterASCII:
+		if c.scaleAddr == "" { return errors.New("scale adapter ascii needs scale.addr / -scale-addr host:port") }
+	case siteconfig.AdapterLaumasRTU:
+		if c.scaleSerial == "" && c.scaleAddr == "" { return errors.New("scale adapter laumas-rtu needs scale.serial (COMx) or scale.addr (serial gateway host:port)") }
+		if c.scaleSerial != "" && c.scaleAddr != "" { return errors.New("laumas-rtu: use either scale.serial or scale.addr, not both") }
+		if c.scaleSlave < 1 || c.scaleSlave > 247 { return errors.New("scale slave address must be 1..247") }
+		if c.scaleStopBits != 1 && c.scaleStopBits != 2 { return errors.New("scale stop bits must be 1 or 2") }
+		c.scaleParity = strings.ToUpper(strings.TrimSpace(c.scaleParity))
+		if c.scaleParity != "N" && c.scaleParity != "E" && c.scaleParity != "O" { return errors.New("scale parity must be N, E or O") }
+		if c.laumasStableBit > 15 { return errors.New("laumas stable bit must be -1 or 0..15") }
+		if c.laumasOverloadMask > 0xFFFF || c.laumasFaultMask > 0xFFFF { return errors.New("laumas masks are 16-bit") }
+	}
+	if c.ioAdapter == siteconfig.AdapterModbusTCP && c.ioAddr == "" { return errors.New("io adapter modbustcp needs io.addr / -io-addr host:port") }
+	return nil
+}
+
+// hardwareProfile describes what each component really is.
+func hardwareProfile(c config) siteconfig.Profile {
+	var p siteconfig.Profile
+	scaleDetail := c.scaleAddr
+	switch c.scaleProtocol {
+	case siteconfig.AdapterLaumasRTU:
+		scaleDetail = c.scaleAddr
+		if c.scaleSerial != "" { scaleDetail = fmt.Sprintf("%s %d %s%d slave %d", c.scaleSerial, c.scaleBaud, c.scaleParity, c.scaleStopBits, c.scaleSlave) }
+	case siteconfig.AdapterFake:
+		scaleDetail = "in-process, bench panel"
+	}
+	p.Set(siteconfig.CompScale, c.scaleProtocol, scaleDetail)
+	ioDetail := c.ioAddr
+	if c.ioAdapter == siteconfig.AdapterFake { ioDetail = "in-process, bench panel" }
+	p.Set(siteconfig.CompIO, c.ioAdapter, ioDetail)
+	p.Set(siteconfig.CompRFID, c.rfidAdapter, "POST /io/rfid")
+	p.Set(siteconfig.CompLPR, c.lprAdapter, "POST /io/lpr")
+	p.Set(siteconfig.CompCameras, c.cameraAdapter, c.cameraIDs)
+	return p
 }
 
 func manageService(action string) error {
@@ -124,10 +283,13 @@ func manageService(action string) error {
 func run(ctx context.Context, c config) error {
 	weightAudit:=&rawjournal.Journal{Path:c.rawWeightJournal};if err:=weightAudit.Verify();err!=nil&&!os.IsNotExist(err){return fmt.Errorf("raw weight audit integrity: %w",err)}
 	eventAudit:=&auditjournal.Journal{Path:c.eventJournal};if err:=eventAudit.Verify();err!=nil&&!os.IsNotExist(err){return fmt.Errorf("operational event audit integrity: %w",err)}
+	profile:=hardwareProfile(c)
+	if sim:=profile.Simulated();len(sim)>0{log.Printf("WARNING hardware profile %s: simulated components %v; real: %v",profile.Mode(),sim,realComponents(profile))}else{log.Printf("hardware profile %s",profile.Mode())}
+	if _,err:=eventAudit.Append(ctx,domain.AuditEvent{StationID:c.stationID,AtUTC:time.Now().UTC(),Kind:domain.AuditHardwareProfile,Source:"edge-startup",Action:profile.Mode(),Data:profile.View(),RuntimeGitSHA:gitSHA});err!=nil{return fmt.Errorf("hardware profile audit: %w",err)}
 	store,err:=sqlitestore.Open(c.dbPath);if err!=nil{return fmt.Errorf("SQLite edge store: %w",err)};defer store.Close()
 	if st,err:=store.Status(ctx);err!=nil{return fmt.Errorf("SQLite edge store integrity: %w",err)}else{log.Printf("SQLite ready path=%s schema=%d tickets=%d queued=%d called=%d completed_cycles=%d pending_sync=%d",st.Path,st.Schema,st.Tickets,st.QueuedCycles,st.CalledCycles,st.CompletedCycles,st.PendingSync)}
 
-	pairPolicy:=domain.PairPolicy{MinElapsed:c.pairMinElapsed,MaxElapsed:c.pairMaxElapsed,MinGrossKG:c.pairMinGrossKG,MaxGrossKG:c.pairMaxGrossKG,MinTareKG:c.pairMinTareKG,MaxTareKG:c.pairMaxTareKG,MinNetKG:c.pairMinNetKG,MaxNetKG:c.pairMaxNetKG}
+	pairPolicy:=domain.PairPolicy{RequireGrossFirst:c.pairRequireGrossFirst,MinElapsed:c.pairMinElapsed,MaxElapsed:c.pairMaxElapsed,MinGrossKG:c.pairMinGrossKG,MaxGrossKG:c.pairMaxGrossKG,MinTareKG:c.pairMinTareKG,MaxTareKG:c.pairMaxTareKG,MinNetKG:c.pairMinNetKG,MaxNetKG:c.pairMaxNetKG}
 	cycleCoordinator:=cycle.New(store,pairPolicy);commitBridge:=twopass.NewCommitBridge(cycleCoordinator)
 	vehicleRegistry,err:=registry.Parse(c.vehicleMap);if err!=nil{return fmt.Errorf("vehicle map: %w",err)}
 	innerWorkflow:=engine.New(engine.Config{StationID:c.stationID,EmptyScaleMaxKG:c.emptyScaleMaxKG,MinStableWeightKG:c.minStableWeightKG,StableConfirmations:c.stableConfirmations,StableToleranceKG:c.stableToleranceKG},commitBridge,vehicleRegistry)
@@ -140,17 +302,48 @@ func run(ctx context.Context, c config) error {
 	rfid.OnObservation=func(o domain.RFIDObservation){if err:=workflow.ObserveRFID(context.Background(),o);err!=nil{log.Printf("workflow RFID observation: %v",err)}}
 	lpr.OnObservation=func(o domain.LPRObservation){if err:=workflow.ObserveLPR(context.Background(),o);err!=nil{log.Printf("workflow LPR observation: %v",err)}}
 
-	scaleMonitor:=scaleascii.NewMonitor(c.scaleAddr!="",c.scaleAddr)
-	if c.scaleAddr!=""{collector:=&scaleascii.StreamCollector{Addr:c.scaleAddr,StationID:c.stationID,TransactionID:workflow.ActiveTransactionID,Journal:weightAudit,ReconnectDelay:c.reconnectDelay,OnReading:func(a domain.AuditedScaleReading){scaleMonitor.Reading(a.Reading);_ = workflow.ClearFault(context.Background(),domain.DeviceScale);if err:=workflow.ObserveScale(context.Background(),a);err!=nil{log.Printf("workflow audited scale observation: %v",err)}},OnFault:func(err error){scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:err.Error(),Overridable:false,Critical:true})}};go func(){if err:=collector.Run(ctx);err!=nil&&ctx.Err()==nil{scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:"raw weight collector stopped: "+err.Error(),Overridable:false,Critical:true});log.Printf("CRITICAL raw weight collector stopped: %v",err)}}()}
+	laumas:=c.scaleProtocol==siteconfig.AdapterLaumasRTU
+	var benchScale *fakescale.Scale
+	scaleSource:=c.scaleAddr;if laumas&&c.scaleSerial!=""{scaleSource=fmt.Sprintf("%s@%d",c.scaleSerial,c.scaleBaud)}
+	if c.scaleProtocol==siteconfig.AdapterFake{scaleSource="FAKE-SCALE"}
+	scaleMonitor:=scaleascii.NewMonitor(c.scaleProtocol!=siteconfig.AdapterNone,scaleSource)
+	if laumas{
+		decode:=laumasrtu.DecodeConfig{OverloadMask:uint16(c.laumasOverloadMask),FaultMask:uint16(c.laumasFaultMask)};if c.laumasStableBit>=0{decode.StableBit=uint(c.laumasStableBit);decode.StableBitSet=true}
+		dial:=laumasrtu.TCPDialer(c.scaleAddr,2*time.Second);if c.scaleSerial!=""{dial=laumasrtu.SerialDialer(laumasrtu.SerialConfig{Port:c.scaleSerial,Baud:c.scaleBaud,Parity:c.scaleParity[0],StopBits:c.scaleStopBits})}
+		collector:=&laumasrtu.Collector{Source:scaleSource,Dial:dial,Slave:byte(c.scaleSlave),PollInterval:c.scalePoll,ResponseTimeout:c.scaleResponseTimeout,ReconnectDelay:c.reconnectDelay,MaxMissedPolls:c.scaleMissedPolls,StationID:c.stationID,TransactionID:workflow.ActiveTransactionID,Journal:weightAudit,Decode:decode,
+			OnReading:func(a domain.AuditedScaleReading){scaleMonitor.Reading(a.Reading);_ = workflow.ClearFault(context.Background(),domain.DeviceScale);if err:=workflow.ObserveScale(context.Background(),a);err!=nil{log.Printf("workflow audited scale observation: %v",err)}},
+			OnFault:func(err error){scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:err.Error(),Overridable:false,Critical:true})}}
+		go func(){if err:=collector.Run(ctx);err!=nil&&ctx.Err()==nil{scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:"laumas collector stopped: "+err.Error(),Overridable:false,Critical:true});log.Printf("CRITICAL laumas raw weight collector stopped: %v",err)}}()
+	}
+	if c.scaleProtocol==siteconfig.AdapterFake{
+		benchScale=&fakescale.Scale{Poll:c.scalePoll,Settle:c.fakeSettle,StationID:c.stationID,TransactionID:workflow.ActiveTransactionID,Journal:weightAudit,
+			OnReading:func(a domain.AuditedScaleReading){scaleMonitor.Reading(a.Reading);_ = workflow.ClearFault(context.Background(),domain.DeviceScale);if err:=workflow.ObserveScale(context.Background(),a);err!=nil{log.Printf("workflow audited scale observation: %v",err)}}}
+		go func(){if err:=benchScale.Run(ctx);err!=nil&&ctx.Err()==nil{scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:"fake scale stopped: "+err.Error(),Overridable:false,Critical:true});log.Printf("CRITICAL fake scale stopped: %v",err)}}()
+	}
+	if c.scaleProtocol==siteconfig.AdapterASCII{collector:=&scaleascii.StreamCollector{Addr:c.scaleAddr,StationID:c.stationID,TransactionID:workflow.ActiveTransactionID,Journal:weightAudit,ReconnectDelay:c.reconnectDelay,OnReading:func(a domain.AuditedScaleReading){scaleMonitor.Reading(a.Reading);_ = workflow.ClearFault(context.Background(),domain.DeviceScale);if err:=workflow.ObserveScale(context.Background(),a);err!=nil{log.Printf("workflow audited scale observation: %v",err)}},OnFault:func(err error){scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:err.Error(),Overridable:false,Critical:true})}};go func(){if err:=collector.Run(ctx);err!=nil&&ctx.Err()==nil{scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:"raw weight collector stopped: "+err.Error(),Overridable:false,Critical:true});log.Printf("CRITICAL raw weight collector stopped: %v",err)}}()}
 
 	ioMonitor:=runtimeio.NewMonitor(false);var safeOutputs runtimeio.Outputs
-	if c.ioAddr!=""{mapping,err:=modbustcp.ParseMapping(c.ioMapSpec);if err!=nil{return fmt.Errorf("io-map: %w",err)};if mapping.SafetyClear==nil{log.Printf("WARNING remote I/O enabled without safety_clear mapping; fail-safe SafetyClear=false will block automatic entry")};client:=&modbustcp.Client{Addr:c.ioAddr,UnitID:byte(c.ioUnitID),Timeout:c.ioTimeout};hardwareIO:=&modbustcp.IO{Client:client,Mapping:mapping};auditedOutputs:=&runtimeio.AuditedOutputs{Inner:hardwareIO,Audit:eventAudit,StationID:c.stationID,RuntimeGitSHA:gitSHA,TransactionID:workflow.ActiveTransactionID,OnAuditFailure:func(err error){_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceAuditStore,Health:domain.HealthFault,Reason:"operational audit output gate failed: "+err.Error(),Overridable:false,Critical:true})}};safeOutputs=auditedOutputs;ioMonitor=runtimeio.NewMonitor(true);controller:=&runtimeio.Controller{Workflow:workflow,Inputs:hardwareIO,Outputs:auditedOutputs,Monitor:ioMonitor,PollInterval:c.ioPoll,BuzzerPulse:c.buzzerPulse,BarrierFeedbackTimeout:c.barrierFeedbackTimeout};go func(){if err:=controller.Run(ctx);err!=nil&&ctx.Err()==nil{log.Printf("CRITICAL runtime I/O controller stopped: %v",err)}}()}
+	var benchIO *fakeio.IO
+	if c.ioAdapter!=siteconfig.AdapterNone{
+		var inputs runtimeio.Inputs;var innerOutputs runtimeio.Outputs
+		if c.ioAdapter==siteconfig.AdapterFake{
+			benchIO=fakeio.New(c.fakeBarrierDelay,c.fakeSafetyClear);inputs,innerOutputs=benchIO,benchIO
+		}else{
+			mapping,err:=modbustcp.ParseMapping(c.ioMapSpec);if err!=nil{return fmt.Errorf("io-map: %w",err)}
+			if mapping.SafetyClear==nil{log.Printf("WARNING remote I/O enabled without safety_clear mapping; fail-safe SafetyClear=false will block automatic entry")}
+			client:=&modbustcp.Client{Addr:c.ioAddr,UnitID:byte(c.ioUnitID),Timeout:c.ioTimeout};hardwareIO:=&modbustcp.IO{Client:client,Mapping:mapping};inputs,innerOutputs=hardwareIO,hardwareIO
+		}
+		auditedOutputs:=&runtimeio.AuditedOutputs{Inner:innerOutputs,Audit:eventAudit,StationID:c.stationID,RuntimeGitSHA:gitSHA,TransactionID:workflow.ActiveTransactionID,OnAuditFailure:func(err error){_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceAuditStore,Health:domain.HealthFault,Reason:"operational audit output gate failed: "+err.Error(),Overridable:false,Critical:true})}}
+		safeOutputs=auditedOutputs;ioMonitor=runtimeio.NewMonitor(true)
+		controller:=&runtimeio.Controller{Workflow:workflow,Inputs:inputs,Outputs:auditedOutputs,Monitor:ioMonitor,PollInterval:c.ioPoll,BuzzerPulse:c.buzzerPulse,BarrierFeedbackTimeout:c.barrierFeedbackTimeout}
+		go func(){if err:=controller.Run(ctx);err!=nil&&ctx.Err()==nil{log.Printf("CRITICAL runtime I/O controller stopped: %v",err)}}()
+	}
 
-	central:=&centralsync.Worker{Store:store,Audit:eventAudit,Config:centralsync.Config{TicketURL:c.centralTicketURL,HeartbeatURL:c.centralHeartbeatURL,BearerToken:c.centralToken,StationID:c.stationID,Version:version,GitSHA:gitSHA,Interval:c.centralSyncInterval,HeartbeatEvery:c.centralHeartbeatInterval,Timeout:c.centralTimeout}}
+	central:=&centralsync.Worker{Store:store,Audit:eventAudit,Config:centralsync.Config{BlockReason:centralBlockReason(profile,c.centralAllowSimulated),Hardware:profile.View(),TicketURL:c.centralTicketURL,HeartbeatURL:c.centralHeartbeatURL,BearerToken:c.centralToken,StationID:c.stationID,Version:version,GitSHA:gitSHA,Interval:c.centralSyncInterval,HeartbeatEvery:c.centralHeartbeatInterval,Timeout:c.centralTimeout}}
 	if c.centralTicketURL!=""||c.centralHeartbeatURL!=""{go func(){if err:=central.Run(ctx);err!=nil&&ctx.Err()==nil{log.Printf("Central sync worker stopped: %v",err)}}()}
 
 	cameraIDs:=parseIDs(c.cameraIDs)
-	s:=&httpapi.Server{RFID:rfid,LPR:lpr,WeightAudit:weightAudit,EventAudit:eventAudit,ScaleMonitor:scaleMonitor,Workflow:workflow,Cycles:cycleCoordinator,CameraIDs:cameraIDs,IOStatus:func()any{return ioMonitor.Snapshot()},CentralStatus:func()any{return central.Snapshot()},StorageStatus:func(x context.Context)(any,error){return store.Status(x)},LatestTicket:store.LastTicket,AllowSimulation:c.simulation,Version:version,GitSHA:gitSHA}
+	s:=&httpapi.Server{RFID:rfid,LPR:lpr,WeightAudit:weightAudit,EventAudit:eventAudit,ScaleMonitor:scaleMonitor,Workflow:workflow,Cycles:cycleCoordinator,CameraIDs:cameraIDs,IOStatus:func()any{return ioMonitor.Snapshot()},CentralStatus:func()any{return central.Snapshot()},StorageStatus:func(x context.Context)(any,error){return store.Status(x)},LatestTicket:store.LastTicket,RecentTickets:store.RecentTickets,Vehicles:func()any{return vehicleRegistry.List()},AllowSimulation:c.simulation,Hardware:func()any{return profile.View()},FakeIOState:fakeIOState(benchIO),FakeIOPatch:fakeIOPatch(benchIO),FakeScaleState:fakeScaleState(benchScale),FakeScalePatch:fakeScalePatch(benchScale),Version:version,GitSHA:gitSHA}
 	httpServer:=&http.Server{Addr:c.listen,Handler:s.Handler(),ReadHeaderTimeout:5*time.Second};httpErr:=make(chan error,1)
 	go func(){err:=httpServer.ListenAndServe();if err!=nil&&!errors.Is(err,http.ErrServerClosed){httpErr<-err;return};httpErr<-nil}()
 	log.Printf("plantops-edge-scale %s sha=%s http=%s simulation=%v db=%s two_pass=true cameras=%v central=%v",version,gitSHA,c.listen,c.simulation,c.dbPath,keys(cameraIDs),central.Snapshot().Enabled)
@@ -162,3 +355,44 @@ func run(ctx context.Context, c config) error {
 
 func parseIDs(spec string)map[string]bool{out:=map[string]bool{};for _,raw:=range strings.Split(spec,","){id:=strings.ToUpper(strings.TrimSpace(raw));if id!=""{out[id]=true}};return out}
 func keys(m map[string]bool)[]string{out:=make([]string,0,len(m));for k:=range m{out=append(out,k)};return out}
+
+func centralBlockReason(p siteconfig.Profile, allow bool) string {
+	sim := p.Simulated()
+	if len(sim) == 0 || allow { return "" }
+	return fmt.Sprintf("tickets are not delivered to Central while components are simulated (%s); use -central-allow-simulated to override", strings.Join(sim, ", "))
+}
+
+func realComponents(p siteconfig.Profile) []string {
+	var out []string
+	for _, e := range p.Entries { if !e.Simulated && e.Adapter != siteconfig.AdapterNone { out = append(out, string(e.Component)) } }
+	return out
+}
+
+func fakeIOState(io *fakeio.IO) func() any {
+	if io == nil { return nil }
+	return func() any { return io.State() }
+}
+func fakeIOPatch(io *fakeio.IO) func(json.RawMessage) error {
+	if io == nil { return nil }
+	return func(raw json.RawMessage) error {
+		var p fakeio.InputsPatch
+		dec := json.NewDecoder(strings.NewReader(string(raw))); dec.DisallowUnknownFields()
+		if err := dec.Decode(&p); err != nil { return err }
+		io.Patch(p)
+		return nil
+	}
+}
+func fakeScaleState(sc *fakescale.Scale) func() any {
+	if sc == nil { return nil }
+	return func() any { return sc.State() }
+}
+func fakeScalePatch(sc *fakescale.Scale) func(json.RawMessage) error {
+	if sc == nil { return nil }
+	return func(raw json.RawMessage) error {
+		var p fakescale.Patch
+		dec := json.NewDecoder(strings.NewReader(string(raw))); dec.DisallowUnknownFields()
+		if err := dec.Decode(&p); err != nil { return err }
+		sc.Apply(p)
+		return nil
+	}
+}

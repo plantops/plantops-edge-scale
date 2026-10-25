@@ -26,6 +26,7 @@ const (
 	AuditHeartbeat          AuditKind = "HEARTBEAT"
 	AuditTransactionDone    AuditKind = "TRANSACTION_COMPLETED"
 	AuditTransactionReset   AuditKind = "TRANSACTION_RESET"
+	AuditHardwareProfile    AuditKind = "HARDWARE_PROFILE"
 )
 
 type AuditRef struct {

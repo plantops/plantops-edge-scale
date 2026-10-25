@@ -92,7 +92,7 @@ func TestInvalidPairNeverCompletesOrClearsQueue(t *testing.T) {
 	if err := s.OpenCycle(ctx, cycle); err != nil { t.Fatal(err) }
 	if err := s.CallCycle(ctx, cycle.ID, time.Now().UTC()); err != nil { t.Fatal(err) }
 	second := sampleSecondPass(cycle)
-	second.Weight.WeightKG = 30000 // tare >= gross: invalid inbound/unload pair
+	second.Weight.WeightKG = cycle.FirstPass.Weight.WeightKG // equal weights: no net, never a valid pair
 	cycle2, ok, err := s.GetCycle(ctx, cycle.ID)
 	if err != nil || !ok { t.Fatal(err) }
 	cycle2.SecondPass = &second
@@ -102,6 +102,33 @@ func TestInvalidPairNeverCompletesOrClearsQueue(t *testing.T) {
 	st, _ := s.Status(ctx)
 	if st.CalledCycles != 1 || st.Tickets != 0 || st.PendingSync != 0 {
 		t.Fatalf("invalid pair cleared/corrupted queue: %+v", st)
+	}
+}
+
+// Outbound material: pass 1 is the empty truck (tare), pass 2 the loaded truck
+// (gross). The durable ticket must carry gross/tare by role and the flow.
+func TestTareFirstPairCompletesAsMaterialOut(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "edge.db"))
+	if err != nil { t.Fatal(err) }
+	defer s.Close()
+
+	cycle := sampleCycle()
+	cycle.FirstPass.Weight.WeightKG = 9100
+	if err := s.OpenCycle(ctx, cycle); err != nil { t.Fatal(err) }
+	if err := s.CallCycle(ctx, cycle.ID, time.Now().UTC()); err != nil { t.Fatal(err) }
+	second := sampleSecondPass(cycle)
+	second.Weight.WeightKG = 27000
+	called, ok, err := s.GetCycle(ctx, cycle.ID)
+	if err != nil || !ok { t.Fatal(err) }
+	called.SecondPass = &second
+	if err := s.CompleteCycle(ctx, called, domain.Ticket{ID: "T-OUT"}); err != nil {
+		t.Fatalf("tare-first pair must complete: %v", err)
+	}
+	last, ok, err := s.LastTicket(ctx)
+	if err != nil || !ok { t.Fatalf("last ok=%v err=%v", ok, err) }
+	if last.Flow != domain.FlowMaterialOut || last.GrossKG != 27000 || last.TareKG != 9100 || last.NetKG != 17900 {
+		t.Fatalf("tare-first ticket wrong: %+v", last)
 	}
 }
 

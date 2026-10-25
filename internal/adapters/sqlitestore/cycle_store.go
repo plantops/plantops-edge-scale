@@ -271,6 +271,7 @@ func (s *Store) CompleteCycle(ctx context.Context, cycle domain.WeighCycle, tick
 	cycle.GrossKG = validation.GrossKG
 	cycle.TareKG = validation.TareKG
 	cycle.NetKG = validation.NetKG
+	cycle.Flow = validation.Flow
 	cycle.LastBlockReason = ""
 	cycle.CompletedAt = &now
 
@@ -492,6 +493,7 @@ func finalTicketFromCycle(ticket domain.Ticket, cycle domain.WeighCycle, now tim
 	ticket.GrossKG = cycle.GrossKG
 	ticket.TareKG = cycle.TareKG
 	ticket.NetKG = cycle.NetKG
+	ticket.Flow = cycle.Flow
 	ticket.FirstWeightObservedAt = cycle.FirstPass.Weight.ObservedAt
 	ticket.SecondWeightObservedAt = second.Weight.ObservedAt
 	ticket.FirstWeightRawRef = cycle.FirstPass.Weight.RawRef

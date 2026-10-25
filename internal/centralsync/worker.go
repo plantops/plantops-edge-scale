@@ -32,6 +32,13 @@ type Config struct {
 	HeartbeatEvery time.Duration
 	Batch int
 	Timeout time.Duration
+
+	// BlockReason, when set, stops ticket delivery: tickets stay pending and are
+	// not attempted. Used when part of the site is simulated, so a bench ticket
+	// can never be delivered to Central as production data.
+	BlockReason string
+	// Hardware is added to every heartbeat so Central can see what is simulated.
+	Hardware map[string]any
 }
 
 type Status struct {
@@ -43,6 +50,8 @@ type Status struct {
 	LastHeartbeatAt time.Time `json:"last_heartbeat_at,omitempty"`
 	LastErrorAt time.Time `json:"last_error_at,omitempty"`
 	LastError string `json:"last_error,omitempty"`
+	TicketSyncBlocked bool `json:"ticket_sync_blocked,omitempty"`
+	BlockReason string `json:"block_reason,omitempty"`
 }
 
 type Worker struct {
@@ -56,7 +65,7 @@ type Worker struct {
 
 func (w *Worker) Snapshot() Status {
 	w.mu.RLock();defer w.mu.RUnlock()
-	s:=w.status;s.Enabled=w.Config.TicketURL!=""||w.Config.HeartbeatURL!="";s.TicketSyncEnabled=w.Config.TicketURL!="";s.HeartbeatEnabled=w.Config.HeartbeatURL!="";return s
+	s:=w.status;s.TicketSyncBlocked=w.Config.TicketURL!=""&&w.Config.BlockReason!="";s.BlockReason=w.Config.BlockReason;s.Enabled=w.Config.TicketURL!=""||w.Config.HeartbeatURL!="";s.TicketSyncEnabled=w.Config.TicketURL!="";s.HeartbeatEnabled=w.Config.HeartbeatURL!="";return s
 }
 
 func (w *Worker) Run(ctx context.Context) error {
@@ -70,6 +79,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 func (w *Worker) syncOnce(ctx context.Context) error {
 	if w.Config.TicketURL==""{return nil}
+	if w.Config.BlockReason!=""{return nil}
 	batch:=w.Config.Batch;if batch<=0||batch>100{batch=20}
 	items,err:=w.Store.PendingSync(ctx,batch);if err!=nil{w.fail(err);return err}
 	for _,item:=range items{
@@ -90,7 +100,7 @@ func (w *Worker) syncOnce(ctx context.Context) error {
 
 func (w *Worker) heartbeat(ctx context.Context) error {
 	if w.Config.HeartbeatURL==""{return nil}
-	payload,_:=json.Marshal(map[string]any{"station_id":w.Config.StationID,"version":w.Config.Version,"git_sha":w.Config.GitSHA,"at_utc":time.Now().UTC()})
+	payload,_:=json.Marshal(map[string]any{"station_id":w.Config.StationID,"version":w.Config.Version,"git_sha":w.Config.GitSHA,"at_utc":time.Now().UTC(),"hardware":w.Config.Hardware})
 	status,err:=w.post(ctx,w.Config.HeartbeatURL,payload)
 	if err!=nil{w.fail(err);return err};if status<200||status>=300{err=fmt.Errorf("heartbeat HTTP %d",status);w.fail(err);return err}
 	now:=time.Now().UTC();w.mu.Lock();w.status.LastHeartbeatAt=now;w.status.LastError="";w.mu.Unlock();_ = w.audit(ctx,domain.AuditHeartbeat,"","sent",map[string]any{"http_status":status});return nil

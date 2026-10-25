@@ -455,6 +455,15 @@ func (e *Engine) tryAuthorizeEntryLocked() {
 	if e.tx == nil || e.tx.Identity != domain.IdentityAccepted || e.tx.State == domain.StateFaultLockout {
 		return
 	}
+	// Entry can only be granted while the truck is still waiting to come on. This
+	// function is reached from identity re-evaluation, which the edge triggers on
+	// every healthy scale frame (ClearFault); without this guard a transaction that
+	// was already weighed and released was pulled back to ENTRY_AUTHORIZED as soon
+	// as the deck read empty, re-opening the entry lamp and barrier while the exit
+	// side was still open.
+	if e.tx.State != domain.StateApproach && e.tx.State != domain.StateIdentifying {
+		return
+	}
 	p := e.tx.PositionSnapshot
 	if !p.SafetyClear {
 		e.tx.LastBlockReason = "physical safety is not clear for entry barrier motion"

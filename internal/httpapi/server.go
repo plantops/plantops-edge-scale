@@ -49,7 +49,16 @@ type Server struct {
 	CentralStatus   func() any
 	StorageStatus   func(context.Context) (any,error)
 	LatestTicket    func(context.Context) (domain.Ticket,bool,error)
+	RecentTickets   func(context.Context,int) ([]domain.Ticket,error)
+	Vehicles        func() any
 	AllowSimulation bool
+	// Hardware reports which components are real and which are simulated.
+	Hardware func() any
+	// Bench controls exist only for components configured with adapter "fake".
+	FakeIOState    func() any
+	FakeIOPatch    func(json.RawMessage) error
+	FakeScaleState func() any
+	FakeScalePatch func(json.RawMessage) error
 	Version         string
 	GitSHA          string
 }
@@ -72,6 +81,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/storage/status",func(w http.ResponseWriter,r *http.Request){if s.StorageStatus==nil{writeJSON(w,http.StatusServiceUnavailable,map[string]string{"error":"storage not configured"});return};st,err:=s.StorageStatus(r.Context());if err!=nil{writeJSON(w,http.StatusInternalServerError,map[string]string{"error":err.Error()});return};writeJSON(w,http.StatusOK,st)})
 	mux.HandleFunc("GET /api/tickets/latest",func(w http.ResponseWriter,r *http.Request){if s.LatestTicket==nil{writeJSON(w,http.StatusServiceUnavailable,map[string]string{"error":"ticket reader not configured"});return};t,ok,err:=s.LatestTicket(r.Context());if err!=nil{writeJSON(w,http.StatusInternalServerError,map[string]string{"error":err.Error()});return};if !ok{writeJSON(w,http.StatusNotFound,map[string]string{"error":"no completed ticket"});return};writeJSON(w,http.StatusOK,t)})
 
+	mux.HandleFunc("GET /api/tickets/recent",func(w http.ResponseWriter,r *http.Request){if s.RecentTickets==nil{writeJSON(w,http.StatusServiceUnavailable,map[string]string{"error":"ticket reader not configured"});return};ts,err:=s.RecentTickets(r.Context(),parseLimit(r,20));if err!=nil{writeJSON(w,http.StatusInternalServerError,map[string]string{"error":err.Error()});return};if ts==nil{ts=[]domain.Ticket{}};writeJSON(w,http.StatusOK,map[string]any{"count":len(ts),"tickets":ts})})
+	mux.HandleFunc("GET /api/vehicles",func(w http.ResponseWriter,_ *http.Request){if s.Vehicles==nil{writeJSON(w,http.StatusOK,map[string]any{"vehicles":[]any{}});return};writeJSON(w,http.StatusOK,map[string]any{"vehicles":s.Vehicles()})})
 	mux.HandleFunc("GET /api/queue",func(w http.ResponseWriter,r *http.Request){if s.Cycles==nil{writeJSON(w,http.StatusServiceUnavailable,map[string]string{"error":"two-pass cycle coordinator not configured"});return};items,err:=s.Cycles.Queue(r.Context());if err!=nil{writeJSON(w,http.StatusInternalServerError,map[string]string{"error":err.Error()});return};writeJSON(w,http.StatusOK,map[string]any{"count":len(items),"items":items})})
 	mux.HandleFunc("POST /api/queue/{cycleID}/call",func(w http.ResponseWriter,r *http.Request){if s.Cycles==nil{writeJSON(w,http.StatusServiceUnavailable,map[string]string{"error":"two-pass cycle coordinator not configured"});return};id:=r.PathValue("cycleID");if id==""{writeJSON(w,http.StatusBadRequest,map[string]string{"error":"cycle id required"});return};if err:=s.Cycles.Call(r.Context(),id);err!=nil{writeJSON(w,http.StatusConflict,map[string]string{"error":err.Error()});return};items,err:=s.Cycles.Queue(r.Context());if err!=nil{writeJSON(w,http.StatusAccepted,map[string]any{"status":"called","cycle_id":id});return};writeJSON(w,http.StatusAccepted,map[string]any{"status":"called","cycle_id":id,"count":len(items),"items":items})})
 
@@ -99,6 +110,15 @@ func (s *Server) Handler() http.Handler {
 		var in struct{Role string `json:"role"`;ImageRef string `json:"image_ref"`;CapturedAt time.Time `json:"captured_at"`};if err:=json.NewDecoder(r.Body).Decode(&in);err!=nil||in.ImageRef==""{writeJSON(w,http.StatusBadRequest,map[string]string{"error":"image_ref required"});return};if in.CapturedAt.IsZero(){in.CapturedAt=time.Now().UTC()};if in.Role==""{in.Role="OVERVIEW"}
 		e:=domain.CameraEvidence{CameraID:id,Role:in.Role,ImageRef:in.ImageRef,CapturedAt:in.CapturedAt};if err:=s.Workflow.ObserveCamera(r.Context(),e);err!=nil{writeJSON(w,http.StatusConflict,map[string]string{"error":err.Error()});return};writeJSON(w,http.StatusAccepted,map[string]any{"status":"accepted","evidence":e})
 	})
+
+	mux.HandleFunc("GET /api/hardware",func(w http.ResponseWriter,_ *http.Request){if s.Hardware==nil{writeJSON(w,http.StatusOK,map[string]any{"mode":"UNKNOWN"});return};writeJSON(w,http.StatusOK,s.Hardware())})
+	bench:=func(path string,state func()any,patch func(json.RawMessage)error){
+		if state==nil{return}
+		mux.HandleFunc("GET "+path,func(w http.ResponseWriter,_ *http.Request){writeJSON(w,http.StatusOK,state())})
+		if patch!=nil{mux.HandleFunc("POST "+path,func(w http.ResponseWriter,r *http.Request){var raw json.RawMessage;if err:=json.NewDecoder(http.MaxBytesReader(w,r.Body,1<<16)).Decode(&raw);err!=nil{writeJSON(w,http.StatusBadRequest,map[string]string{"error":err.Error()});return};if err:=patch(raw);err!=nil{writeJSON(w,http.StatusBadRequest,map[string]string{"error":err.Error()});return};writeJSON(w,http.StatusAccepted,state())})}
+	}
+	bench("/api/fake/io",s.FakeIOState,s.FakeIOPatch)
+	bench("/api/fake/scale",s.FakeScaleState,s.FakeScalePatch)
 
 	if s.AllowSimulation&&s.Workflow!=nil{
 		mux.HandleFunc("POST /sim/position",func(w http.ResponseWriter,r *http.Request){var p domain.PositionSnapshot;if err:=json.NewDecoder(r.Body).Decode(&p);err!=nil{writeJSON(w,http.StatusBadRequest,map[string]string{"error":err.Error()});return};if p.Observed.IsZero(){p.Observed=time.Now().UTC()};if err:=s.Workflow.ObservePosition(r.Context(),p);err!=nil{writeJSON(w,http.StatusConflict,map[string]string{"error":err.Error()});return};writeJSON(w,http.StatusAccepted,s.Workflow.Snapshot())})

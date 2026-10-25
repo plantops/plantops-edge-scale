@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/domain"
@@ -17,6 +18,16 @@ type Static struct {
 func (s Static) ResolveRFID(_ context.Context, tag string) (domain.VehicleIdentity, bool, error) {
 	v, ok := s.Vehicles[strings.TrimSpace(tag)]
 	return v, ok, nil
+}
+
+// List returns the registered vehicles ordered by plate.
+func (s Static) List() []domain.VehicleIdentity {
+	out := make([]domain.VehicleIdentity, 0, len(s.Vehicles))
+	for _, v := range s.Vehicles {
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Plate < out[j].Plate })
+	return out
 }
 
 // Parse accepts comma-separated TAG=PLATE pairs, for example:
