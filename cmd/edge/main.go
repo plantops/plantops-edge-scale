@@ -15,6 +15,7 @@ import (
 
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/auditjournal"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/ingress"
+	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/laumasrtu"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/modbustcp"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/rawjournal"
 	"github.com/ngtrthanh/plantops-edge-scale/goedge/internal/adapters/registry"
@@ -51,6 +52,13 @@ type config struct {
 	pairMinGrossKG, pairMaxGrossKG, pairMinTareKG, pairMaxTareKG int64
 	pairMinNetKG, pairMaxNetKG int64
 	pairRequireGrossFirst bool
+	scaleProtocol, scaleSerial, scaleParity string
+	scaleBaud, scaleStopBits int
+	scaleSlave uint
+	scalePoll, scaleResponseTimeout time.Duration
+	scaleMissedPolls int
+	laumasStableBit int
+	laumasOverloadMask, laumasFaultMask uint
 	centralTicketURL, centralHeartbeatURL, centralToken string
 	centralSyncInterval, centralHeartbeatInterval, centralTimeout time.Duration
 	simulation bool
@@ -74,6 +82,18 @@ func parseFlags() (config, string) {
 	flag.StringVar(&c.scaleAddr,"scale-addr","","scale controller TCP address host:port; empty disables live collector")
 	flag.StringVar(&c.rawWeightJournal,"raw-weight-journal","data/raw-weight.jsonl","append-only raw weight audit journal path")
 	flag.StringVar(&c.eventJournal,"event-journal","data/events.jsonl","append-only operational event audit journal path")
+	flag.StringVar(&c.scaleProtocol,"scale-protocol","ascii","scale protocol: ascii (TCP line stream, placeholder) or laumas-rtu (Laumas W100/W200 Modbus RTU poll)")
+	flag.StringVar(&c.scaleSerial,"scale-serial","","laumas-rtu: native COM port, e.g. COM3 (Windows). Empty = use -scale-addr as a serial-gateway TCP address")
+	flag.IntVar(&c.scaleBaud,"scale-baud",9600,"laumas-rtu serial baud rate")
+	flag.StringVar(&c.scaleParity,"scale-parity","N","laumas-rtu serial parity: N, E or O")
+	flag.IntVar(&c.scaleStopBits,"scale-stop-bits",1,"laumas-rtu serial stop bits: 1 or 2")
+	flag.UintVar(&c.scaleSlave,"scale-slave",1,"laumas-rtu Modbus slave address 1..247")
+	flag.DurationVar(&c.scalePoll,"scale-poll",100*time.Millisecond,"laumas-rtu poll interval (every poll is one raw-journal record)")
+	flag.DurationVar(&c.scaleResponseTimeout,"scale-response-timeout",300*time.Millisecond,"laumas-rtu per-poll response timeout")
+	flag.IntVar(&c.scaleMissedPolls,"scale-missed-polls",3,"laumas-rtu consecutive missed/damaged polls before the scale fault is raised")
+	flag.IntVar(&c.laumasStableBit,"laumas-stable-bit",-1,"laumas-rtu status bit meaning STABLE; -1 = verified default (bit 11)")
+	flag.UintVar(&c.laumasOverloadMask,"laumas-overload-mask",0,"laumas-rtu status mask meaning OVERLOAD; 0 = not decoded (verify against the manual first)")
+	flag.UintVar(&c.laumasFaultMask,"laumas-fault-mask",0,"laumas-rtu status mask meaning indicator FAULT; 0 = not decoded (verify against the manual first)")
 	flag.DurationVar(&c.reconnectDelay,"scale-reconnect-delay",2*time.Second,"delay before reconnecting to scale controller")
 	flag.StringVar(&c.ioAddr,"io-addr","","Modbus TCP remote I/O host:port; empty disables hardware I/O")
 	flag.UintVar(&c.ioUnitID,"io-unit-id",1,"Modbus TCP unit identifier 0..255")
@@ -107,6 +127,19 @@ func parseFlags() (config, string) {
 	flag.StringVar(&serviceAction,"service","","Windows Service action: install|start|stop|status|uninstall")
 	flag.Parse()
 	if c.ioUnitID > 255 { log.Fatal("io-unit-id must be 0..255") }
+	switch c.scaleProtocol {
+	case "ascii":
+	case "laumas-rtu":
+		if c.scaleSerial == "" && c.scaleAddr == "" { log.Fatal("scale-protocol laumas-rtu needs -scale-serial COMx or -scale-addr host:port (serial gateway)") }
+		if c.scaleSerial != "" && c.scaleAddr != "" { log.Fatal("use either -scale-serial or -scale-addr with laumas-rtu, not both") }
+		if c.scaleSlave < 1 || c.scaleSlave > 247 { log.Fatal("scale-slave must be 1..247") }
+		if c.scaleStopBits != 1 && c.scaleStopBits != 2 { log.Fatal("scale-stop-bits must be 1 or 2") }
+		c.scaleParity=strings.ToUpper(strings.TrimSpace(c.scaleParity));if c.scaleParity!="N"&&c.scaleParity!="E"&&c.scaleParity!="O"{log.Fatal("scale-parity must be N, E or O")}
+		if c.laumasStableBit > 15 { log.Fatal("laumas-stable-bit must be -1 or 0..15") }
+		if c.laumasOverloadMask > 0xFFFF || c.laumasFaultMask > 0xFFFF { log.Fatal("laumas masks are 16-bit") }
+	default:
+		log.Fatalf("unknown -scale-protocol %q; use ascii or laumas-rtu", c.scaleProtocol)
+	}
 	if c.pairMinElapsed < 0 || c.pairMaxElapsed < 0 { log.Fatal("pair elapsed limits cannot be negative") }
 	if c.pairMaxElapsed > 0 && c.pairMinElapsed > c.pairMaxElapsed { log.Fatal("pair-min-elapsed cannot exceed pair-max-elapsed") }
 	return c, serviceAction
@@ -142,8 +175,18 @@ func run(ctx context.Context, c config) error {
 	rfid.OnObservation=func(o domain.RFIDObservation){if err:=workflow.ObserveRFID(context.Background(),o);err!=nil{log.Printf("workflow RFID observation: %v",err)}}
 	lpr.OnObservation=func(o domain.LPRObservation){if err:=workflow.ObserveLPR(context.Background(),o);err!=nil{log.Printf("workflow LPR observation: %v",err)}}
 
-	scaleMonitor:=scaleascii.NewMonitor(c.scaleAddr!="",c.scaleAddr)
-	if c.scaleAddr!=""{collector:=&scaleascii.StreamCollector{Addr:c.scaleAddr,StationID:c.stationID,TransactionID:workflow.ActiveTransactionID,Journal:weightAudit,ReconnectDelay:c.reconnectDelay,OnReading:func(a domain.AuditedScaleReading){scaleMonitor.Reading(a.Reading);_ = workflow.ClearFault(context.Background(),domain.DeviceScale);if err:=workflow.ObserveScale(context.Background(),a);err!=nil{log.Printf("workflow audited scale observation: %v",err)}},OnFault:func(err error){scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:err.Error(),Overridable:false,Critical:true})}};go func(){if err:=collector.Run(ctx);err!=nil&&ctx.Err()==nil{scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:"raw weight collector stopped: "+err.Error(),Overridable:false,Critical:true});log.Printf("CRITICAL raw weight collector stopped: %v",err)}}()}
+	laumas:=c.scaleProtocol=="laumas-rtu"
+	scaleSource:=c.scaleAddr;if laumas&&c.scaleSerial!=""{scaleSource=fmt.Sprintf("%s@%d",c.scaleSerial,c.scaleBaud)}
+	scaleMonitor:=scaleascii.NewMonitor(scaleSource!="",scaleSource)
+	if laumas{
+		decode:=laumasrtu.DecodeConfig{OverloadMask:uint16(c.laumasOverloadMask),FaultMask:uint16(c.laumasFaultMask)};if c.laumasStableBit>=0{decode.StableBit=uint(c.laumasStableBit);decode.StableBitSet=true}
+		dial:=laumasrtu.TCPDialer(c.scaleAddr,2*time.Second);if c.scaleSerial!=""{dial=laumasrtu.SerialDialer(laumasrtu.SerialConfig{Port:c.scaleSerial,Baud:c.scaleBaud,Parity:c.scaleParity[0],StopBits:c.scaleStopBits})}
+		collector:=&laumasrtu.Collector{Source:scaleSource,Dial:dial,Slave:byte(c.scaleSlave),PollInterval:c.scalePoll,ResponseTimeout:c.scaleResponseTimeout,ReconnectDelay:c.reconnectDelay,MaxMissedPolls:c.scaleMissedPolls,StationID:c.stationID,TransactionID:workflow.ActiveTransactionID,Journal:weightAudit,Decode:decode,
+			OnReading:func(a domain.AuditedScaleReading){scaleMonitor.Reading(a.Reading);_ = workflow.ClearFault(context.Background(),domain.DeviceScale);if err:=workflow.ObserveScale(context.Background(),a);err!=nil{log.Printf("workflow audited scale observation: %v",err)}},
+			OnFault:func(err error){scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:err.Error(),Overridable:false,Critical:true})}}
+		go func(){if err:=collector.Run(ctx);err!=nil&&ctx.Err()==nil{scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:"laumas collector stopped: "+err.Error(),Overridable:false,Critical:true});log.Printf("CRITICAL laumas raw weight collector stopped: %v",err)}}()
+	}
+	if !laumas&&c.scaleAddr!=""{collector:=&scaleascii.StreamCollector{Addr:c.scaleAddr,StationID:c.stationID,TransactionID:workflow.ActiveTransactionID,Journal:weightAudit,ReconnectDelay:c.reconnectDelay,OnReading:func(a domain.AuditedScaleReading){scaleMonitor.Reading(a.Reading);_ = workflow.ClearFault(context.Background(),domain.DeviceScale);if err:=workflow.ObserveScale(context.Background(),a);err!=nil{log.Printf("workflow audited scale observation: %v",err)}},OnFault:func(err error){scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:err.Error(),Overridable:false,Critical:true})}};go func(){if err:=collector.Run(ctx);err!=nil&&ctx.Err()==nil{scaleMonitor.Fault(err);_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceScale,Health:domain.HealthFault,Reason:"raw weight collector stopped: "+err.Error(),Overridable:false,Critical:true});log.Printf("CRITICAL raw weight collector stopped: %v",err)}}()}
 
 	ioMonitor:=runtimeio.NewMonitor(false);var safeOutputs runtimeio.Outputs
 	if c.ioAddr!=""{mapping,err:=modbustcp.ParseMapping(c.ioMapSpec);if err!=nil{return fmt.Errorf("io-map: %w",err)};if mapping.SafetyClear==nil{log.Printf("WARNING remote I/O enabled without safety_clear mapping; fail-safe SafetyClear=false will block automatic entry")};client:=&modbustcp.Client{Addr:c.ioAddr,UnitID:byte(c.ioUnitID),Timeout:c.ioTimeout};hardwareIO:=&modbustcp.IO{Client:client,Mapping:mapping};auditedOutputs:=&runtimeio.AuditedOutputs{Inner:hardwareIO,Audit:eventAudit,StationID:c.stationID,RuntimeGitSHA:gitSHA,TransactionID:workflow.ActiveTransactionID,OnAuditFailure:func(err error){_ = workflow.ObserveFault(context.Background(),domain.Fault{Device:domain.DeviceAuditStore,Health:domain.HealthFault,Reason:"operational audit output gate failed: "+err.Error(),Overridable:false,Critical:true})}};safeOutputs=auditedOutputs;ioMonitor=runtimeio.NewMonitor(true);controller:=&runtimeio.Controller{Workflow:workflow,Inputs:hardwareIO,Outputs:auditedOutputs,Monitor:ioMonitor,PollInterval:c.ioPoll,BuzzerPulse:c.buzzerPulse,BarrierFeedbackTimeout:c.barrierFeedbackTimeout};go func(){if err:=controller.Run(ctx);err!=nil&&ctx.Err()==nil{log.Printf("CRITICAL runtime I/O controller stopped: %v",err)}}()}
