@@ -297,6 +297,31 @@ func (s *Store) LastTicket(ctx context.Context) (domain.Ticket, bool, error) {
 	return t, true, nil
 }
 
+// RecentTickets returns up to limit completed tickets, newest first.
+func (s *Store) RecentTickets(ctx context.Context, limit int) ([]domain.Ticket, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, "SELECT ticket_json FROM tickets ORDER BY committed_at DESC, rowid DESC LIMIT ?", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.Ticket
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var t domain.Ticket
+		if err := json.Unmarshal([]byte(raw), &t); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) PendingSync(ctx context.Context, limit int) ([]SyncItem, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
